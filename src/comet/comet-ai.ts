@@ -817,7 +817,15 @@ export class CometAI {
               })
               .map(el => el.innerText.trim());
             if (validTexts.length > 0) {
-              response = validTexts.slice(-3).join('\\n\\n');
+              const seen = new Set();
+              const unique = [];
+              for (const t of validTexts) {
+                const key = t.substring(0, 120);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                unique.push(t);
+              }
+              response = unique.slice(-3).join('\\n\\n');
             }
           }
 
@@ -846,7 +854,7 @@ export class CometAI {
           status,
           steps: [...new Set(steps)].slice(-5),
           currentStep: steps.length > 0 ? steps[steps.length - 1] : '',
-          response: response.substring(0, 8000),
+          response: response.substring(0, 32000),
           hasStopButton: hasActiveStopButton,
           surface: onSidecar ? 'sidecar' : (onSearchPage ? 'thread' : 'home'),
           awaitingInput,
