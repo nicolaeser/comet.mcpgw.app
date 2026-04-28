@@ -1,15 +1,23 @@
 import type { ToolResult } from "../../types.js";
 
-export function textResult(text: string): ToolResult {
+export function textResult(
+  text: string,
+  structuredContent?: Record<string, unknown>,
+): ToolResult {
   return {
     content: [{ type: "text", text }],
+    ...(structuredContent && { structuredContent }),
   };
 }
 
-export function errorResult(text: string): ToolResult {
+export function errorResult(
+  text: string,
+  structuredContent?: Record<string, unknown>,
+): ToolResult {
   return {
     content: [{ type: "text", text }],
     isError: true,
+    ...(structuredContent && { structuredContent }),
   };
 }
 

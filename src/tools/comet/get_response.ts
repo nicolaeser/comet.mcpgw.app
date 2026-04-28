@@ -1,12 +1,14 @@
 import { z } from "zod";
+import { saveCometStatusResult } from "../../comet/result-capture.js";
 import { taskRegistry } from "../../comet/task-registry.js";
 import { defineTool } from "../_shared/define-tool.js";
 import { errorResult, textResult } from "../_shared/tool-result.js";
+import { cometStatusStructured } from "./_structured.js";
 
 const tool = defineTool({
   name: "comet_get_response",
   title: "Peek at a task's current response",
-  description: "Return whatever response text is currently visible on the task's tab, even if the agent is still streaming. Unlike comet_poll, this never waits — it just grabs the latest snapshot. Useful for incremental UIs that want partial output, or for confirming what came back without re-running the polling loop.",
+  description: "Return whatever response text is currently visible on the task's tab, even if the agent is still streaming. Unlike comet_poll, this never waits — it just grabs the latest snapshot and updates the retained result record. Useful for incremental UIs that want partial output.",
   rateLimit: { tool: { max: 120 } },
   annotations: {
     readOnlyHint: true,
@@ -23,6 +25,7 @@ const tool = defineTool({
     try {
       return await taskRegistry.withTask(task_id, async (task) => {
         const status = await task.ai.getAgentStatus();
+        await saveCometStatusResult(task, status, "comet_get_response");
         const lines: string[] = [
           `Task: ${task.id}`,
           `Status: ${status.status.toUpperCase()}${status.hasStopButton ? " (streaming)" : ""}`,
@@ -47,7 +50,14 @@ const tool = defineTool({
         } else {
           lines.push("(no response text yet)");
         }
-        return textResult(lines.join("\n"));
+        return textResult(
+          lines.join("\n"),
+          cometStatusStructured(task, status, {
+            status: status.awaitingInput ? "input_required" : status.status,
+            result_delivery: status.status === "completed" ? "direct" : "async",
+            partial: status.status !== "completed",
+          }),
+        );
       });
     } catch (err) {
       return errorResult(

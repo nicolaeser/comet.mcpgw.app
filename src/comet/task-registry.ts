@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { CometAI } from "./comet-ai.js";
 import {
+  isCompletedCometStatus,
+  saveCometStatusResult,
+} from "./result-capture.js";
+import { cometResultStore } from "./result-store.js";
+import {
   CometCDPClient,
   cdpCloseTab,
   cdpGetVersion,
@@ -495,6 +500,9 @@ export class TaskRegistry {
     } catch {
 
     }
+
+    await this.persistResultBeforeClose(task);
+
     if (task.attachedKind !== "new") {
       try {
         await task.ai.setTabLabel(null);
@@ -581,6 +589,35 @@ export class TaskRegistry {
       { privacySafe: true },
     );
     return true;
+  }
+
+  private async persistResultBeforeClose(task: CometTask): Promise<void> {
+    const existing = await cometResultStore.get(task.id);
+    if (existing?.status === "completed") return;
+
+    try {
+      const status = await task.ai.getAgentStatus();
+      const completed = isCompletedCometStatus(status);
+      await saveCometStatusResult(
+        task,
+        status,
+        "task_close",
+        completed ? "completed" : "closed",
+        completed,
+      );
+    } catch (err) {
+      const latest = await cometResultStore.get(task.id);
+      if (latest?.status === "completed") return;
+      await cometResultStore.save({
+        taskId: task.id,
+        label: task.label,
+        status: "closed",
+        error: err instanceof Error ? err.message : String(err),
+        keepAlive: task.keepAlive,
+        autoCloseOnCompletion: task.autoCloseOnCompletion,
+        source: "task_close",
+      });
+    }
   }
 
   async closeAll(): Promise<void> {

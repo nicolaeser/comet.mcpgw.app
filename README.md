@@ -14,7 +14,7 @@ MCP Client  →  comet.mcpgw.app (HTTP)  →  CDP  →  Comet Browser  →  Perp
 ```
 
 Purpose-built so the coding model stays focused on code while Comet handles
-login walls, dynamic pages, and deep agentic research. **31 MCP tools, 3
+login walls, dynamic pages, and deep agentic research. **33 MCP tools, 3
 resources, 3 prompts**, fully isolated per-task parallelism.
 
 ---
@@ -70,7 +70,7 @@ npm run dev
 
 ---
 
-## Tools (31)
+## Tools (33)
 
 **Lifecycle**
 | Tool | What it does |
@@ -88,6 +88,8 @@ npm run dev
 | `comet_ask` | Send a prompt and wait for the answer. Completed one-shot tasks auto-close by default; pass `closeAfter=false` for follow-up/inspection. Parallel-safe across distinct `task_id`s. |
 | `comet_poll` | Non-blocking status check; returns the response when COMPLETED. |
 | `comet_get_response` | Peek at the latest visible answer without waiting. |
+| `comet_results` | Read retained task results after tabs were closed or async work finished in the background. |
+| `comet_result_delete` | Delete retained result records early. |
 | `comet_stop` | Click Perplexity's Stop button. |
 | `comet_mode` | Switch search / research / labs / learn. |
 | `comet_accept_banner` | Manual accept of the "Allow browser control" banner. |
@@ -133,10 +135,16 @@ open when Comet is still working, waiting for confirmation, or when the caller
 passes `closeAfter=false`. `closeTimeout` can be used to keep a completed tab
 available briefly for inspection before it closes.
 
-For asynchronous clients such as n8n, call `comet_ask` with `wait=false`, then
-poll with `comet_poll`. The task inherits the same auto-close preference and
-will close when `comet_poll` observes completion unless `closeAfter=false` was
-set on the ask or poll call.
+`comet_ask` returns the final answer directly when Comet finishes within the
+tool-call window. If the run is still active at the timeout, the call returns a
+structured async handoff with `task_id`, `next.poll`, `next.partial`, and
+`next.result`; the server keeps a background watcher running and retains the
+final answer for `comet_results task_id=...`.
+
+For asynchronous clients such as n8n, call `comet_ask` with `wait=false` to
+submit immediately and always use the retained-result path. The task inherits
+the same auto-close preference and will close on completion unless
+`closeAfter=false` was set.
 
 ### Auxiliary tab cleanup
 
@@ -281,7 +289,7 @@ Perplexity login flow. The first login always needs a real display.
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `SESSION_TTL_MS` | `1800000` | MCP session inactivity timeout. |
-| `REDIS_URL` | — | Optional Redis for sessions/rate-limit/tasks. |
+| `REDIS_URL` | — | Optional Redis for sessions/rate-limit/tasks/retained results. |
 | `RATE_LIMIT_WINDOW_MS` | `60000` | Default rate-limit window. |
 | `RATE_LIMIT_CLIENT_ID_HEADER` | `x-client-id` | Header used for per-client rate limits. |
 
@@ -297,6 +305,10 @@ Perplexity login flow. The first login always needs a real display.
 | `COMET_MAX_STREAM_REQUESTS` | `100` | Per-task fetch-backed SSE request buffer cap. |
 | `COMET_MAX_STREAM_TEXT` | `250000` | Max decoded SSE text kept per streamed request. |
 | `COMET_MAX_WEBSOCKET` | `1000` | Per-task WebSocket frame buffer cap for Comet agent-channel status. |
+| `COMET_RESULT_TTL_MS` | `2592000000` | Retained result lifetime, default 30 days. |
+| `COMET_RESULT_MAX_TEXT` | `1000000` | Max response text retained per result. |
+| `COMET_RESULT_WATCH_TIMEOUT_MS` | `1800000` | Background watcher timeout for async handoff tasks. |
+| `COMET_RESULT_WATCH_INTERVAL_MS` | `2000` | Background watcher poll interval. |
 | `COMET_ENABLE_EVAL` | `false` | Turn on `comet_eval` (XSS-equivalent inside the tab). |
 
 ### Redis layout (when `REDIS_URL` is set)
@@ -305,13 +317,14 @@ Perplexity login flow. The first login always needs a real display.
 - DB 1: Rate limiting
 - DB 2: MCP tasks
 - DB 3: Tool cache
+- DB 4: Retained Comet results
 
 ---
 
 ## Project layout
 
 - `src/comet/` — CDP client (`cdp-client.ts`), per-task helper (`comet-ai.ts`), task registry.
-- `src/tools/comet/` — the 31 `comet_*` MCP tools.
+- `src/tools/comet/` — the 33 `comet_*` MCP tools.
 - `src/resources/comet/` — overview, hosting guide, recipes.
 - `src/prompts/comet/` — research / parallel-questions / scrape templates.
 - `src/http/` — Express server, auth, routing.
@@ -330,9 +343,19 @@ holding the call open:
 { "prompt": "Use your browser to ...", "wait": false }
 ```
 
-Then poll the returned `task_id` with `comet_poll` until it returns the final
-answer, or use `comet_get_response` for partial text. Completed tasks close
-automatically when `comet_poll` observes completion unless `closeAfter=false`
-is set. The bridge watches Comet's `/rest/sse/perplexity_ask` stream and agent
-signals via CDP, so status can keep moving even when DOM-based UI detection is
-brittle.
+Then either poll the returned `task_id` with `comet_poll`, or let the server's
+background watcher retain the final answer and read it later:
+
+```json
+{ "name": "comet_results", "arguments": { "task_id": "<task_id>" } }
+```
+
+Completed tasks close automatically after the result is retained unless
+`closeAfter=false` is set. The bridge watches Comet's
+`/rest/sse/perplexity_ask` stream and agent signals via CDP, so status can keep
+moving even when DOM-based UI detection is brittle.
+
+For interactive MCP clients such as Claude Code, leaving `wait=true` is usually
+best: quick runs return the final text directly, while long runs still return a
+machine-readable async handoff instead of failing or leaking a partial answer as
+if it were complete.

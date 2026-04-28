@@ -6,10 +6,11 @@ import { errorResult, textResult } from "../_shared/tool-result.js";
 const tool = defineTool({
   name: "comet_task_close",
   title: "Close a Comet task",
-  description: "Tear down a task: waits for any in-flight tool call against it to finish, closes the underlying Comet tab plus any auxiliary tabs the agent opened during the task (e.g. third-party sites it browsed), then detaches the CDP socket. Auxiliary tabs are detected via a snapshot diff against the targets that existed when the task was created, excluding tabs claimed by other active tasks. Pass `all=true` to close every active task at once. Idempotent — closing a non-existent task_id returns a notice, not an error.",
+  description: "Tear down a task: waits for any in-flight tool call against it to finish, persists the latest visible result/status for comet_results, closes the underlying Comet tab plus any auxiliary tabs the agent opened during the task, then detaches the CDP socket. Pass `all=true` to close every active task at once. Idempotent — closing a non-existent task_id returns a notice, not an error.",
   rateLimit: { tool: { max: 30 } },
   annotations: {
     readOnlyHint: false,
+    destructiveHint: true,
     idempotentHint: true,
     openWorldHint: true,
   },

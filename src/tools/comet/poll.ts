@@ -1,12 +1,14 @@
 import { z } from "zod";
+import { saveCometStatusResult } from "../../comet/result-capture.js";
 import { taskRegistry } from "../../comet/task-registry.js";
 import { defineTool } from "../_shared/define-tool.js";
 import { errorResult, textResult } from "../_shared/tool-result.js";
+import { cometStatusStructured } from "./_structured.js";
 
 const tool = defineTool({
   name: "comet_poll",
   title: "Poll Comet status",
-  description: "Non-blocking status check for a task. Returns IDLE | WORKING | COMPLETED, any visible step list, and the agent's browsing URL if it spawned a child tab. When status is COMPLETED, returns the response text directly. Call this in a loop (~3s) after a comet_ask that returned 'still in progress', or use comet_get_response if you only want the partial text right now.",
+  description: "Non-blocking status check for a task. Returns IDLE | WORKING | COMPLETED, any visible step list, and the agent's browsing URL if it spawned a child tab. When status is COMPLETED, returns the response text directly and retains it for comet_results before any auto-close. Use comet_get_response for partial text.",
   rateLimit: { tool: { max: 120 } },
   annotations: {
     readOnlyHint: true,
@@ -37,14 +39,30 @@ const tool = defineTool({
             closeAfter === true ||
             (closeAfter === undefined &&
               (task.autoCloseOnCompletion ?? !task.keepAlive));
+          await saveCometStatusResult(
+            task,
+            status,
+            "comet_poll",
+            "completed",
+            shouldClose,
+          );
           if (shouldClose) {
             const id = task.id;
             setImmediate(() => {
               void taskRegistry.close(id).catch(() => {});
             });
           }
-          return textResult(status.response);
+          return textResult(
+            status.response,
+            cometStatusStructured(task, status, {
+              status: "completed",
+              completed: true,
+              result_delivery: "direct",
+            }),
+          );
         }
+
+        await saveCometStatusResult(task, status, "comet_poll");
 
         const lines: string[] = [
           `Task: ${task.id}`,
@@ -88,7 +106,16 @@ const tool = defineTool({
           lines.push(`Use comet_stop task_id=${task.id} to interrupt or comet_screenshot task_id=${task.id} to inspect.`);
         }
 
-        return textResult(lines.join("\n"));
+        return textResult(
+          lines.join("\n"),
+          cometStatusStructured(task, status, {
+            status: status.awaitingInput ? "input_required" : status.status,
+            result_delivery:
+              status.status === "completed" && status.response
+                ? "direct"
+                : "async",
+          }),
+        );
       });
     } catch (err) {
       return errorResult(

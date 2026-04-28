@@ -1,7 +1,15 @@
 import { z } from "zod";
+import { cometResultStore } from "../../comet/result-store.js";
+import {
+  isCompletedCometStatus,
+  saveCometStatusResult,
+  saveSubmittedCometResult,
+} from "../../comet/result-capture.js";
+import { ensureCometResultWatcher } from "../../comet/result-watcher.js";
 import { taskRegistry } from "../../comet/task-registry.js";
 import { defineTool } from "../_shared/define-tool.js";
 import { errorResult, textResult } from "../_shared/tool-result.js";
+import { cometStatusStructured, cometTaskStructured } from "./_structured.js";
 
 const POLL_INTERVAL_MS = 1_500;
 const IDLE_TIMEOUT_MS = 6_000;
@@ -44,6 +52,22 @@ function transformForAgentic(prompt: string): string {
     }
   }
   return `Use your browser to ${prompt.toLowerCase().startsWith("go") ? "" : "go and "}${prompt}`;
+}
+
+function asyncHandoffText(
+  taskId: string,
+  heading: string,
+  extraLines: string[] = [],
+): string {
+  return [
+    `Task ${taskId}: ${heading}`,
+    "",
+    `Poll: comet_poll task_id=${taskId}`,
+    `Result: comet_results task_id=${taskId}`,
+    `Partial: comet_get_response task_id=${taskId}`,
+    `Cancel: comet_stop task_id=${taskId}`,
+    ...extraLines,
+  ].join("\n");
 }
 
 const tool = defineTool({
@@ -105,8 +129,9 @@ const tool = defineTool({
       .default(true)
       .describe(
         "If false, submit the prompt and return immediately with the task_id instead " +
-          "of holding the MCP request open. This is the safer mode for n8n and other " +
-          "workflow runners with short tool-call timeouts; poll with comet_poll.",
+          "of holding the MCP request open. The server keeps a background watcher " +
+          "running and retains the final result for comet_results. This is the safer " +
+          "mode for n8n and other workflow runners with short tool-call timeouts.",
       ),
   },
   async execute({ prompt, task_id, context, newChat, timeout, closeAfter, closeTimeout, wait }, ctx) {
@@ -128,6 +153,8 @@ const tool = defineTool({
         shouldCloseResolvedTask = true;
       }
     };
+    const closeAfterCompleted = (keepAlive: boolean) =>
+      wantsCloseAfterCompleted(closeAfter, keepAlive);
     try {
       if (!effectiveTaskId) {
         const existing = taskRegistry.resolveOrNull();
@@ -179,6 +206,11 @@ const tool = defineTool({
         const beforeKey = `${before.count}|${before.lastLength}|${before.lastText}`;
 
         await ai.sendPrompt(finalPrompt);
+        await saveSubmittedCometResult(
+          task,
+          finalPrompt,
+          wait ? "comet_ask" : "comet_ask_async",
+        );
 
         try {
           await ai.acceptBrowserControlBanner();
@@ -186,30 +218,28 @@ const tool = defineTool({
 
         }
 
+        const startResultWatcher = () => {
+          ensureCometResultWatcher(task.id, {
+            timeoutMs: timeout,
+            closeTimeoutMs: closeTimeout,
+          });
+        };
+
         if (!wait) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: [
-                  `Task ${task.id}: prompt submitted.`,
-                  "Status: WORKING",
-                  "",
-                  `Poll with comet_poll task_id=${task.id}.`,
-                  task.autoCloseOnCompletion
-                    ? "The task will auto-close when comet_poll observes completion."
-                    : "The task will stay open after completion.",
-                  `Peek partial text with comet_get_response task_id=${task.id}.`,
-                ].join("\n"),
-              },
-            ],
-            structuredContent: {
-              task_id: task.id,
+          startResultWatcher();
+          return textResult(
+            asyncHandoffText(task.id, "prompt submitted and running.", [
+              "",
+              task.autoCloseOnCompletion
+                ? "Auto-close: yes, after completion is captured."
+                : "Auto-close: no, task will stay open after completion.",
+            ]),
+            cometTaskStructured(task, {
               status: "working",
               submitted: true,
-              auto_close_on_completion: task.autoCloseOnCompletion,
-            },
-          };
+              result_delivery: "async",
+            }),
+          );
         }
 
         const start = Date.now();
@@ -230,7 +260,20 @@ const tool = defineTool({
         while (Date.now() - start < timeout) {
           if (ctx.abortSignal.aborted) {
             await stopOnAbort();
-            return errorResult(`comet_ask was cancelled (task ${task.id})`);
+            await cometResultStore.save({
+              taskId: task.id,
+              label: task.label,
+              status: "failed",
+              error: "comet_ask was cancelled.",
+              source: "comet_ask",
+            });
+            return errorResult(
+              `comet_ask was cancelled (task ${task.id})`,
+              cometTaskStructured(task, {
+                status: "failed",
+                error: "comet_ask was cancelled.",
+              }),
+            );
           }
 
           await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
@@ -310,8 +353,22 @@ const tool = defineTool({
             );
 
             if (status.status === "completed" && sawNewResponse && status.response) {
+              await saveCometStatusResult(
+                task,
+                status,
+                "comet_ask",
+                "completed",
+                closeAfterCompleted(task.keepAlive),
+              );
               markCloseAfterCompleted(task.keepAlive);
-              return textResult(status.response);
+              return textResult(
+                status.response,
+                cometStatusStructured(task, status, {
+                  status: "completed",
+                  completed: true,
+                  result_delivery: "direct",
+                }),
+              );
             }
             if (
               status.isStable &&
@@ -320,8 +377,22 @@ const tool = defineTool({
               !status.hasStopButton &&
               !status.awaitingInput
             ) {
+              await saveCometStatusResult(
+                task,
+                status,
+                "comet_ask",
+                "completed",
+                closeAfterCompleted(task.keepAlive),
+              );
               markCloseAfterCompleted(task.keepAlive);
-              return textResult(status.response);
+              return textResult(
+                status.response,
+                cometStatusStructured(task, status, {
+                  status: "completed",
+                  completed: true,
+                  result_delivery: "direct",
+                }),
+              );
             }
             if (
               awaitingInputSince !== null &&
@@ -335,7 +406,16 @@ const tool = defineTool({
                 `Approve manually in the Comet sidecar, or call comet_accept_banner task_id=${task.id} ` +
                   `(safe confirmations only). Then call comet_poll task_id=${task.id} to resume.`,
               ].filter(Boolean) as string[];
-              return textResult(lines.join("\n"));
+              await saveCometStatusResult(task, status, "comet_ask");
+              startResultWatcher();
+              return textResult(
+                lines.join("\n"),
+                cometStatusStructured(task, status, {
+                  status: "input_required",
+                  result_delivery: "async",
+                  requires_user_action: true,
+                }),
+              );
             }
             const idleMs = Date.now() - lastActivityTime;
             if (
@@ -345,8 +425,22 @@ const tool = defineTool({
               !status.hasStopButton &&
               !status.awaitingInput
             ) {
+              await saveCometStatusResult(
+                task,
+                status,
+                "comet_ask",
+                "completed",
+                closeAfterCompleted(task.keepAlive),
+              );
               markCloseAfterCompleted(task.keepAlive);
-              return textResult(status.response);
+              return textResult(
+                status.response,
+                cometStatusStructured(task, status, {
+                  status: "completed",
+                  completed: true,
+                  result_delivery: "direct",
+                }),
+              );
             }
           } catch (err) {
             consecutiveErrors += 1;
@@ -364,8 +458,19 @@ const tool = defineTool({
                 await client.ensureOnOwnedTab();
                 consecutiveErrors = 0;
               } catch {
+                await cometResultStore.save({
+                  taskId: task.id,
+                  label: task.label,
+                  status: "failed",
+                  error: err instanceof Error ? err.message : String(err),
+                  source: "comet_ask",
+                });
                 return errorResult(
                   `comet_ask aborted after repeated errors (task ${task.id}): ${err instanceof Error ? err.message : String(err)}`,
+                  cometTaskStructured(task, {
+                    status: "failed",
+                    error: err instanceof Error ? err.message : String(err),
+                  }),
                 );
               }
             }
@@ -373,15 +478,32 @@ const tool = defineTool({
         }
 
         const finalStatus = await ai.getAgentStatus();
-        if (finalStatus.response && !finalStatus.awaitingInput) {
-          if (finalStatus.status === "completed" && !finalStatus.hasStopButton) {
+        const completed = isCompletedCometStatus(finalStatus);
+        if (completed && finalStatus.response && !finalStatus.awaitingInput) {
+          const shouldClose = closeAfterCompleted(task.keepAlive);
+          await saveCometStatusResult(
+            task,
+            finalStatus,
+            "comet_ask",
+            "completed",
+            shouldClose,
+          );
+          if (shouldClose) {
             markCloseAfterCompleted(task.keepAlive);
           }
-          return textResult(finalStatus.response);
+          return textResult(
+            finalStatus.response,
+            cometStatusStructured(task, finalStatus, {
+              status: "completed",
+              completed: true,
+              result_delivery: "direct",
+            }),
+          );
         }
 
+        startResultWatcher();
         const lines: string[] = [
-          `Task ${task.id}: still in progress (timeout=${timeout}ms reached).`,
+          `Task ${task.id}: still running after ${timeout}ms.`,
           `Status: ${finalStatus.status.toUpperCase()}`,
         ];
         if (finalStatus.stream.sawSse) {
@@ -402,19 +524,51 @@ const tool = defineTool({
         }
         if (finalStatus.currentStep) lines.push(`Current: ${finalStatus.currentStep}`);
         if (finalStatus.agentBrowsingUrl) lines.push(`Browsing: ${finalStatus.agentBrowsingUrl}`);
+        if (finalStatus.response) {
+          lines.push("");
+          lines.push("Partial response:");
+          lines.push(finalStatus.response);
+        }
         if (collectedSteps.length > 0) {
           lines.push("");
           lines.push("Steps:");
           for (const step of collectedSteps) lines.push(`  • ${step}`);
         }
         lines.push("");
-        lines.push(`Use comet_poll task_id=${task.id} to check progress, comet_stop task_id=${task.id} to cancel.`);
-        return textResult(lines.join("\n"));
+        lines.push(`The server is still watching this task. Use comet_results task_id=${task.id} for the retained final result.`);
+        await saveCometStatusResult(
+          task,
+          finalStatus,
+          "comet_ask_handoff",
+          finalStatus.awaitingInput ? "input_required" : "working",
+        );
+        return textResult(
+          lines.join("\n"),
+          cometStatusStructured(task, finalStatus, {
+            status: finalStatus.awaitingInput ? "input_required" : "working",
+            result_delivery: "async",
+            timeout_ms: timeout,
+            partial: Boolean(finalStatus.response),
+          }),
+        );
       });
       return result;
     } catch (err) {
+      if (resolvedTaskId) {
+        await cometResultStore.save({
+          taskId: resolvedTaskId,
+          status: "failed",
+          error: err instanceof Error ? err.message : String(err),
+          source: "comet_ask",
+        });
+      }
       return errorResult(
         `comet_ask failed: ${err instanceof Error ? err.message : String(err)}`,
+        {
+          ...(resolvedTaskId ? { task_id: resolvedTaskId } : {}),
+          status: "failed",
+          error: err instanceof Error ? err.message : String(err),
+        },
       );
     } finally {
       if (wait && shouldCloseResolvedTask && resolvedTaskId) {

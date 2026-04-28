@@ -8,6 +8,7 @@ let sessionRedisClient: RedisClient | null = null;
 let taskRedisClient: RedisClient | null = null;
 let toolCacheRedisClient: RedisClient | null = null;
 let rateLimitRedisClient: RedisClient | null = null;
+let cometResultRedisClient: RedisClient | null = null;
 
 const baseRedisOptions: RedisOptions = {
   connectTimeout: 5_000,
@@ -69,6 +70,10 @@ export function getRateLimitRedisClient(): RedisClient | null {
   return rateLimitRedisClient;
 }
 
+export function getCometResultRedisClient(): RedisClient | null {
+  return cometResultRedisClient;
+}
+
 export async function initializeRedis(
   config: Pick<RuntimeConfig, "redisUrl">,
 ): Promise<void> {
@@ -88,6 +93,11 @@ export async function initializeRedis(
     config.redisUrl,
     3,
     "Tool cache",
+  );
+  cometResultRedisClient = await connectRedisClient(
+    config.redisUrl,
+    4,
+    "Comet result",
   );
 }
 
@@ -113,16 +123,19 @@ export async function closeRedisClient(): Promise<void> {
   const taskClient = taskRedisClient;
   const toolCacheClient = toolCacheRedisClient;
   const rateLimitClient = rateLimitRedisClient;
+  const cometResultClient = cometResultRedisClient;
 
   sessionRedisClient = null;
   taskRedisClient = null;
   toolCacheRedisClient = null;
   rateLimitRedisClient = null;
+  cometResultRedisClient = null;
 
   await Promise.all([
     closeClient(sessionClient, "Session"),
     closeClient(taskClient, "Task"),
     closeClient(toolCacheClient, "Tool cache"),
     closeClient(rateLimitClient, "Rate limit"),
+    closeClient(cometResultClient, "Comet result"),
   ]);
 }

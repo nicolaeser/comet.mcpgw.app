@@ -42,7 +42,7 @@ const prompt = definePrompt({
     lines.push("Completed one-shot asks self-clean by default. Add closeAfter=false if you need to inspect or continue a tab.");
     lines.push("");
     lines.push("Step 3 — present the answers as a numbered list, one per question.");
-    lines.push("If any task returns 'still in progress', poll with comet_poll task_id=… every 3s.");
+    lines.push("If any task returns an async handoff, poll with comet_poll task_id=... every 3s.");
     return {
       description: `Comet parallel-questions workflow (${list.length} tasks)`,
       messages: [{ role: "user", content: { type: "text", text: lines.join("\n") } }],
