@@ -40,7 +40,7 @@ function transformForAgentic(prompt: string): string {
 const tool = defineTool({
   name: "comet_ask",
   title: "Ask Comet",
-  description: "Send a prompt to a Comet/Perplexity task and wait for the response. Operates on the task identified by `task_id` (or the only active task if omitted). Multiple comet_ask calls can run in parallel as long as each targets a different task_id. Tasks persist across asks: calling comet_ask N times on the same task_id continues the conversation in the same tab. Set `newChat=true` to start a fresh conversation in the same tab, or pass `closeAfter=true` to auto-close the task after the response (useful for one-shot questions). Use comet_task_close to stop a multi-step task explicitly.",
+  description: "Send a prompt to Comet/Perplexity and wait for the response. If `task_id` is omitted, reuses the most-recently-used task or auto-creates one (so you do NOT need to call comet_connect first — just call comet_ask). Tasks persist across calls: passing the same task_id continues the conversation in the same tab; omitting task_id reuses the existing tab instead of opening a new one. Multiple comet_ask calls can run in parallel as long as each targets a different task_id. Set `newChat=true` to start a fresh conversation in the same tab, or `closeAfter=true` to auto-close after the response (one-shot). Use comet_task_close to stop a multi-step task explicitly.",
   rateLimit: { tool: { max: 30 }, client: { max: 10 } },
   annotations: {
     readOnlyHint: false,
@@ -103,8 +103,24 @@ const tool = defineTool({
     finalPrompt = transformForAgentic(finalPrompt);
 
     let resolvedTaskId: string | null = null;
+    let effectiveTaskId = task_id;
     try {
-      const result = await taskRegistry.withTask(task_id, async (task) => {
+      if (!effectiveTaskId) {
+        const existing = taskRegistry.resolveOrNull();
+        if (!existing) {
+          await ctx.sendProgress(0, 5, "no active task — auto-creating one");
+          const created = await taskRegistry.create(undefined, {
+            keepAlive: false,
+            attach: "auto",
+            onProgress: (step, total, message) => ctx.sendProgress(step, total, message),
+          });
+          effectiveTaskId = created.id;
+        } else {
+          effectiveTaskId = existing.id;
+        }
+      }
+
+      const result = await taskRegistry.withTask(effectiveTaskId, async (task) => {
         resolvedTaskId = task.id;
         const { client, ai } = task;
 

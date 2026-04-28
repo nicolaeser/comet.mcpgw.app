@@ -361,13 +361,16 @@ export class TaskRegistry {
     if (all.length === 0) {
       throw new Error("No active task. Call comet_connect first to create one.");
     }
-    if (all.length > 1) {
-      throw new Error(
-        `${all.length} tasks active. Pass task_id explicitly. ` +
-          `Active: ${all.map((t) => t.id).join(", ")}`,
-      );
-    }
-    return all[0];
+    if (all.length === 1) return all[0];
+    return all.reduce((a, b) => (b.lastUsedAt > a.lastUsedAt ? b : a));
+  }
+
+  resolveOrNull(id?: string): CometTask | null {
+    if (id) return this.get(id) ?? null;
+    const all = this.list();
+    if (all.length === 0) return null;
+    if (all.length === 1) return all[0];
+    return all.reduce((a, b) => (b.lastUsedAt > a.lastUsedAt ? b : a));
   }
 
   async withTask<T>(id: string | undefined, op: (task: CometTask) => Promise<T>): Promise<T> {

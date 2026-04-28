@@ -680,7 +680,11 @@ export class CometAI {
 
         let answerEls = [...document.querySelectorAll('[id^="markdown-content-"]')];
         if (answerEls.length === 0) {
-          answerEls = [...document.querySelectorAll('[class*="prose"]')]
+          answerEls = [...document.querySelectorAll(
+            '[class*="prose"], [data-message-author-role="assistant"], [data-role="assistant"], ' +
+            '[data-testid*="assistant"], [data-testid*="message"], [class*="assistant-message"], ' +
+            '[class*="MessageBubble"], [class*="message-bubble"], [class*="chat-message"]'
+          )]
             .filter(el => !el.closest('nav, aside, header, footer, [contenteditable], [data-ask-input-container]'));
         }
         const lastAnswer = answerEls[answerEls.length - 1] || null;
@@ -689,6 +693,14 @@ export class CometAI {
           if (text.length < 1) return false;
           return !['Library', 'Discover', 'Spaces', 'Finance', 'Account', 'Upgrade', 'Home', 'Search'].some(ui => text.startsWith(ui));
         });
+
+        const agenticCompletionPatterns = [
+          "I've completed", "I have completed", "Task complete", "Task completed",
+          "I've finished", "I have finished", "Here's what I found", "Here is what I found",
+          "Here's what I did", "Here is what I did", "Done.", "All done",
+          "Successfully completed", "Aufgabe abgeschlossen", "Fertig.", "Erledigt"
+        ];
+        const hasAgenticCompletion = agenticCompletionPatterns.some(p => body.includes(p));
 
         const workingPatterns = [
           'Working', 'Searching', 'Reviewing sources', 'Preparing to assist',
@@ -720,8 +732,10 @@ export class CometAI {
           status = 'working';
         }
         else if (hasStepsCompleted || hasFinishedMarker) status = 'completed';
+        else if (hasAgenticCompletion && !hasActiveStopButton && !hasLoadingSpinner) status = 'completed';
         else if (inputReadyForFollowUp && hasProseContent) status = 'completed';
         else if (onSearchPage && !hasActiveStopButton && hasProseContent) status = 'completed';
+        else if (onSidecar && !hasActiveStopButton && !hasLoadingSpinner && hasProseContent) status = 'completed';
         else if (hasAskFollowUp && hasProseContent) status = 'completed';
         else if (hasSourcesIndicator && hasProseContent) status = 'completed';
         else if (hasReviewedSources) status = 'completed';
