@@ -1,0 +1,40 @@
+services:
+  mcp:
+    image: ghcr.io/nicolaeser/comet.mcpgw.app:latest
+    container_name: comet.mcpgw.app
+    depends_on:
+      - redis
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      PORT: "3000"
+      PUBLIC_BASE_URL: "https://comet.mcpgw.app"
+      SERVER_NAME: "comet.mcpgw.app"
+      SESSION_TTL_MS: "1800000"
+      AUTH_MODE: "bearer"
+      API_KEY: "change-me-in-production"
+      LOG_LEVEL: "info"
+      LOG_FORMAT: "json"
+      LOG_REDACT: "true"
+      REDIS_URL: "redis://redis:6379"
+      RATE_LIMIT_WINDOW_MS: "60000"
+      RATE_LIMIT_CLIENT_ID_HEADER: "x-client-id"
+      COMET_TASK_IDLE_TTL_MS: "1800000"
+      COMET_MAX_CONSOLE: "500"
+      COMET_MAX_NETWORK: "500"
+      COMET_ENABLE_EVAL: "false"
+      COMET_CDP_URL: "http://host.docker.internal:9222"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/internal-api/heartbeat"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: comet.mcpgw.app-redis
+    restart: unless-stopped

@@ -1,0 +1,38 @@
+services:
+  mcp:
+    build:
+      context: .
+    container_name: comet.mcpgw.app-dev
+    depends_on:
+      - redis
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      PORT: "3000"
+      PUBLIC_BASE_URL: "http://localhost:3000"
+      SERVER_NAME: "comet.mcpgw.app-dev"
+      SESSION_TTL_MS: "1800000"
+      AUTH_MODE: "none"
+      DISABLE_AUTH: "true"
+      LOG_LEVEL: "silent"
+      LOG_FORMAT: "pretty"
+      LOG_REDACT: "true"
+      REDIS_URL: "redis://redis:6379"
+      RATE_LIMIT_WINDOW_MS: "60000"
+      RATE_LIMIT_CLIENT_ID_HEADER: "x-client-id"
+      COMET_ENABLE_EVAL: "true"
+      COMET_CDP_URL: "http://host.docker.internal:9222"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/internal-api/heartbeat"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: comet.mcpgw.app-dev-redis
+    restart: unless-stopped

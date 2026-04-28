@@ -1,0 +1,53 @@
+{
+  "name": "comet.mcpgw.app",
+  "version": "1.0.0",
+  "author": "Nico Laeser",
+  "description": "Streamable-HTTP MCP server that bridges MCP clients to Perplexity Comet via the Chrome DevTools Protocol.",
+  "homepage": "https://comet.mcpgw.app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicolaeser/comet.mcpgw.app.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nicolaeser/comet.mcpgw.app/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "perplexity",
+    "comet",
+    "chrome-devtools-protocol",
+    "cdp",
+    "browser-automation",
+    "claude"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "prebuild": "npm run clean",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run build",
+    "prettier": "npx prettier --write \"src*.{js,jsx,ts,tsx,css,scss,json,md,yml,yaml}\"",
+    "cu": "npx npm-check-updates -u"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.2",
+    "express": "^5.2.1",
+    "ioredis": "^5.10.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.31.14",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

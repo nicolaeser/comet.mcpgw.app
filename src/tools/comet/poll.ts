@@ -1,0 +1,59 @@
+import { z } from "zod";
+import { taskRegistry } from "../../comet/task-registry.js";
+import { defineTool } from "../_shared/define-tool.js";
+import { errorResult, textResult } from "../_shared/tool-result.js";
+
+const tool = defineTool({
+  name: "comet_poll",
+  title: "Poll Comet status",
+  description: "Non-blocking status check for a task. Returns IDLE | WORKING | COMPLETED, any visible step list, and the agent's browsing URL if it spawned a child tab. When status is COMPLETED, returns the response text directly. Call this in a loop (~3s) after a comet_ask that returned 'still in progress', or use comet_get_response if you only want the partial text right now.",
+  rateLimit: { tool: { max: 120 } },
+  annotations: {
+    readOnlyHint: true,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+  inputSchema: {
+    task_id: z
+      .string()
+      .optional()
+      .describe("Task to poll. Required when more than one task is active."),
+  },
+  async execute({ task_id }) {
+    try {
+      return await taskRegistry.withTask(task_id, async (task) => {
+        const status = await task.ai.getAgentStatus();
+
+        if (status.status === "completed" && status.response) {
+          return textResult(status.response);
+        }
+
+        const lines: string[] = [
+          `Task: ${task.id}`,
+          `Status: ${status.status.toUpperCase()}`,
+        ];
+        if (status.agentBrowsingUrl) lines.push(`Browsing: ${status.agentBrowsingUrl}`);
+        if (status.currentStep) lines.push(`Current: ${status.currentStep}`);
+
+        if (status.steps.length > 0) {
+          lines.push("");
+          lines.push("Steps:");
+          for (const step of status.steps) lines.push(`  • ${step}`);
+        }
+
+        if (status.status === "working") {
+          lines.push("");
+          lines.push(`Use comet_stop task_id=${task.id} to interrupt or comet_screenshot task_id=${task.id} to inspect.`);
+        }
+
+        return textResult(lines.join("\n"));
+      });
+    } catch (err) {
+      return errorResult(
+        `comet_poll failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  },
+});
+
+export default tool;
