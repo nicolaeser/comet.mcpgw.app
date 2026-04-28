@@ -142,6 +142,7 @@ export class TaskRegistry {
   private readonly idleTtlMs = envIntMs("COMET_TASK_IDLE_TTL_MS", 30 * 60 * 1000);
   private readonly idleSweepMs = envIntMs("COMET_TASK_IDLE_SWEEP_MS", 60 * 1000);
   private readonly autoSidecarWaitMs = envIntMs("COMET_AUTO_SIDECAR_WAIT_MS", 2_000);
+  private windowFittedOnce = false;
 
   async create(
     label?: string,
@@ -230,6 +231,25 @@ export class TaskRegistry {
     await report(1, "attaching CDP socket");
     const client = new CometCDPClient();
     await client.connect(targetId);
+
+    if (!this.windowFittedOnce && process.env.COMET_AUTO_FIT_WINDOW !== "false") {
+      this.windowFittedOnce = true;
+      const mode = process.env.COMET_AUTO_FIT_WINDOW_MODE === "fullscreen" ? "fullscreen" : "maximize";
+      try {
+        const fit = await client.fitWindowToDisplay({ mode });
+        logger.info(
+          "Comet window fit to display",
+          { ok: fit.ok, state: fit.state, width: fit.width, height: fit.height, error: fit.error },
+          { privacySafe: true },
+        );
+      } catch (err) {
+        logger.warn(
+          "Comet window fit failed",
+          { error: err instanceof Error ? err.message : String(err) },
+          { privacySafe: true },
+        );
+      }
+    }
 
     if (attachedKind === "new") {
       await report(2, "navigating to perplexity.ai");

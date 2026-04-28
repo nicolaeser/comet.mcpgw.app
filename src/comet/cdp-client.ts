@@ -912,6 +912,51 @@ export class CometCDPClient {
     }).clearDeviceMetricsOverride();
   }
 
+  async fitWindowToDisplay(opts: { mode?: "maximize" | "fullscreen" } = {}): Promise<{
+    ok: boolean;
+    width?: number;
+    height?: number;
+    state?: string;
+    error?: string;
+  }> {
+    if (!this.client || !this.ownedTargetId) {
+      return { ok: false, error: "not connected" };
+    }
+    const mode = opts.mode ?? "maximize";
+    try {
+      const browser = this.client.Browser as unknown as {
+        getWindowForTarget: (p: { targetId: string }) => Promise<{
+          windowId: number;
+          bounds: { left?: number; top?: number; width?: number; height?: number; windowState?: string };
+        }>;
+        setWindowBounds: (p: { windowId: number; bounds: Record<string, unknown> }) => Promise<void>;
+      };
+      const { windowId } = await browser.getWindowForTarget({ targetId: this.ownedTargetId });
+      const screen = await this.evaluate(`({
+        w: window.screen.availWidth || window.screen.width,
+        h: window.screen.availHeight || window.screen.height
+      })`);
+      const v = (screen.result.value as { w: number; h: number }) || { w: 0, h: 0 };
+      if (mode === "fullscreen") {
+        await browser.setWindowBounds({ windowId, bounds: { windowState: "fullscreen" } });
+        return { ok: true, state: "fullscreen", width: v.w, height: v.h };
+      }
+      await browser.setWindowBounds({ windowId, bounds: { windowState: "normal" } });
+      await browser.setWindowBounds({
+        windowId,
+        bounds: { left: 0, top: 0, width: v.w || 1440, height: v.h || 900, windowState: "normal" },
+      });
+      try {
+        await browser.setWindowBounds({ windowId, bounds: { windowState: "maximized" } });
+      } catch {
+
+      }
+      return { ok: true, state: "maximized", width: v.w, height: v.h };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   async clickSelector(selector: string): Promise<{ success: boolean; error?: string }> {
     this.ensureClient();
     const r = await this.evaluate(`
