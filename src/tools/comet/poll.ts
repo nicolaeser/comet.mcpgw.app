@@ -32,6 +32,15 @@ const tool = defineTool({
           `Task: ${task.id}`,
           `Status: ${status.status.toUpperCase()}`,
         ];
+        if (status.stream.sawSse) {
+          lines.push(
+            `Stream: ${status.stream.status.toUpperCase()} ` +
+              `(events=${status.stream.eventCount}, textCompleted=${status.stream.textCompleted ? "yes" : "no"})`,
+          );
+        } else if (status.stream.sawAgent) {
+          lines.push("Stream: AGENT CHANNEL ACTIVE");
+        }
+        if (status.stream.error) lines.push(`Stream error: ${status.stream.error}`);
         if (status.awaitingInput) {
           if (status.confirmationKind) lines.push(`Awaiting: ${status.confirmationKind}`);
           if (status.confirmationPrompt) lines.push(`Prompt: ${status.confirmationPrompt}`);

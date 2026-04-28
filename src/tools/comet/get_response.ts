@@ -27,6 +27,14 @@ const tool = defineTool({
           `Task: ${task.id}`,
           `Status: ${status.status.toUpperCase()}${status.hasStopButton ? " (streaming)" : ""}`,
         ];
+        if (status.stream.sawSse) {
+          lines.push(
+            `Stream: ${status.stream.status.toUpperCase()} ` +
+              `(events=${status.stream.eventCount}, textCompleted=${status.stream.textCompleted ? "yes" : "no"})`,
+          );
+        } else if (status.stream.sawAgent) {
+          lines.push("Stream: AGENT CHANNEL ACTIVE");
+        }
         if (status.currentStep) lines.push(`Current step: ${status.currentStep}`);
         lines.push("");
         if (status.response) {

@@ -90,8 +90,16 @@ const tool = defineTool({
           "goes away. The close runs in the background — comet_ask returns as soon " +
           "as the response is ready, regardless of this value.",
       ),
+    wait: z
+      .boolean()
+      .default(true)
+      .describe(
+        "If false, submit the prompt and return immediately with the task_id instead " +
+          "of holding the MCP request open. This is the safer mode for n8n and other " +
+          "workflow runners with short tool-call timeouts; poll with comet_poll.",
+      ),
   },
-  async execute({ prompt, task_id, context, newChat, timeout, closeAfter, closeTimeout }, ctx) {
+  async execute({ prompt, task_id, context, newChat, timeout, closeAfter, closeTimeout, wait }, ctx) {
     let finalPrompt = prompt;
     if (context && context.trim().length > 0) {
       finalPrompt =
@@ -148,6 +156,7 @@ const tool = defineTool({
         }
 
         ai.resetStabilityTracking();
+        client.clearProtocolBuffers();
 
         const before = await ai.getAnswerSnapshot();
         const beforeKey = `${before.count}|${before.lastLength}|${before.lastText}`;
@@ -158,6 +167,28 @@ const tool = defineTool({
           await ai.acceptBrowserControlBanner();
         } catch {
 
+        }
+
+        if (!wait) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: [
+                  `Task ${task.id}: prompt submitted.`,
+                  "Status: WORKING",
+                  "",
+                  `Poll with comet_poll task_id=${task.id}.`,
+                  `Peek partial text with comet_get_response task_id=${task.id}.`,
+                ].join("\n"),
+              },
+            ],
+            structuredContent: {
+              task_id: task.id,
+              status: "working",
+              submitted: true,
+            },
+          };
         }
 
         const start = Date.now();
@@ -250,7 +281,7 @@ const tool = defineTool({
 
             const progressMessage = status.awaitingInput
               ? `awaiting confirmation${status.confirmationKind ? ` (${status.confirmationKind})` : ""}`
-              : status.currentStep || status.status;
+              : status.currentStep || status.stream.currentStep || status.status;
             await ctx.sendProgress(
               Math.min(Date.now() - start, timeout),
               timeout,
@@ -326,6 +357,12 @@ const tool = defineTool({
           `Task ${task.id}: still in progress (timeout=${timeout}ms reached).`,
           `Status: ${finalStatus.status.toUpperCase()}`,
         ];
+        if (finalStatus.stream.sawSse) {
+          lines.push(
+            `Stream: ${finalStatus.stream.status.toUpperCase()} ` +
+              `(events=${finalStatus.stream.eventCount}, textCompleted=${finalStatus.stream.textCompleted ? "yes" : "no"})`,
+          );
+        }
         if (finalStatus.awaitingInput && finalStatus.confirmationPrompt) {
           lines.push(`Awaiting: ${finalStatus.confirmationPrompt}`);
         }
@@ -346,7 +383,7 @@ const tool = defineTool({
         `comet_ask failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
-      if (closeAfter && resolvedTaskId) {
+      if (wait && closeAfter && resolvedTaskId) {
         const id = resolvedTaskId;
         const fire = () => {
           void taskRegistry.close(id).catch(() => {});

@@ -94,8 +94,29 @@ export interface NetworkEntry {
   failureReason?: string;
 }
 
+export interface EventSourceEntry {
+  ts: number;
+  requestId: string;
+  url?: string;
+  eventName: string;
+  eventId?: string;
+  data: string;
+}
+
+export interface WebSocketFrameEntry {
+  ts: number;
+  requestId: string;
+  url?: string;
+  direction: "sent" | "received";
+  opcode?: number;
+  mask?: boolean;
+  payloadData: string;
+}
+
 const MAX_CONSOLE = Number(process.env.COMET_MAX_CONSOLE ?? 500);
 const MAX_NETWORK = Number(process.env.COMET_MAX_NETWORK ?? 500);
+const MAX_EVENT_SOURCE = Number(process.env.COMET_MAX_EVENT_SOURCE ?? 1000);
+const MAX_WEBSOCKET = Number(process.env.COMET_MAX_WEBSOCKET ?? 1000);
 
 export class CometCDPClient {
   private config: CDPConfig;
@@ -115,6 +136,9 @@ export class CometCDPClient {
   private consoleBuffer: ConsoleEntry[] = [];
   private networkBuffer: NetworkEntry[] = [];
   private networkInFlight = new Map<string, NetworkEntry>();
+  private networkUrlByRequestId = new Map<string, string>();
+  private eventSourceBuffer: EventSourceEntry[] = [];
+  private webSocketBuffer: WebSocketFrameEntry[] = [];
 
   private mainFrameLoadCbs = new Set<() => void>();
 
@@ -143,6 +167,10 @@ export class CometCDPClient {
 
   get targetId(): string | undefined {
     return this.ownedTargetId;
+  }
+
+  get childTargets(): string[] {
+    return [...this.childTargetIds];
   }
 
   async isConnectionHealthy(): Promise<boolean> {
@@ -373,6 +401,7 @@ export class CometCDPClient {
           resourceType: p.type ?? "Other",
         };
         this.networkInFlight.set(p.requestId, entry);
+        this.networkUrlByRequestId.set(p.requestId, p.request.url);
         this.pushNetwork(entry);
       });
       network.responseReceived((p) => {
@@ -399,6 +428,66 @@ export class CometCDPClient {
         entry.failureReason = p.errorText;
         entry.durationMs = Date.now() - entry.ts;
         this.networkInFlight.delete(p.requestId);
+      });
+    } catch {
+
+    }
+
+    try {
+      const network = this.client.Network as unknown as {
+        eventSourceMessageReceived: (cb: (p: {
+          requestId: string;
+          timestamp: number;
+          eventName: string;
+          eventId?: string;
+          data: string;
+        }) => void) => void;
+        webSocketCreated: (cb: (p: { requestId: string; url: string }) => void) => void;
+        webSocketFrameReceived: (cb: (p: {
+          requestId: string;
+          timestamp: number;
+          response: { opcode?: number; mask?: boolean; payloadData: string };
+        }) => void) => void;
+        webSocketFrameSent: (cb: (p: {
+          requestId: string;
+          timestamp: number;
+          response: { opcode?: number; mask?: boolean; payloadData: string };
+        }) => void) => void;
+      };
+      network.eventSourceMessageReceived((p) => {
+        this.pushEventSource({
+          ts: Date.now(),
+          requestId: p.requestId,
+          url: this.networkUrlByRequestId.get(p.requestId),
+          eventName: p.eventName,
+          eventId: p.eventId,
+          data: p.data,
+        });
+      });
+      network.webSocketCreated((p) => {
+        this.networkUrlByRequestId.set(p.requestId, p.url);
+      });
+      network.webSocketFrameReceived((p) => {
+        this.pushWebSocketFrame({
+          ts: Date.now(),
+          requestId: p.requestId,
+          url: this.networkUrlByRequestId.get(p.requestId),
+          direction: "received",
+          opcode: p.response.opcode,
+          mask: p.response.mask,
+          payloadData: p.response.payloadData,
+        });
+      });
+      network.webSocketFrameSent((p) => {
+        this.pushWebSocketFrame({
+          ts: Date.now(),
+          requestId: p.requestId,
+          url: this.networkUrlByRequestId.get(p.requestId),
+          direction: "sent",
+          opcode: p.response.opcode,
+          mask: p.response.mask,
+          payloadData: p.response.payloadData,
+        });
       });
     } catch {
 
@@ -781,6 +870,47 @@ export class CometCDPClient {
     this.networkInFlight.clear();
   }
 
+  getEventSourceEntries(opts: {
+    limit?: number;
+    urlSubstring?: string;
+    eventName?: string;
+    substring?: string;
+  } = {}): EventSourceEntry[] {
+    let entries = this.eventSourceBuffer;
+    if (opts.urlSubstring) entries = entries.filter((e) => (e.url ?? "").includes(opts.urlSubstring!));
+    if (opts.eventName) entries = entries.filter((e) => e.eventName === opts.eventName);
+    if (opts.substring) entries = entries.filter((e) => e.data.includes(opts.substring!));
+    if (opts.limit) entries = entries.slice(-opts.limit);
+    return entries;
+  }
+
+  clearEventSourceBuffer(): void {
+    this.eventSourceBuffer = [];
+  }
+
+  getWebSocketFrames(opts: {
+    limit?: number;
+    urlSubstring?: string;
+    direction?: "sent" | "received";
+    substring?: string;
+  } = {}): WebSocketFrameEntry[] {
+    let frames = this.webSocketBuffer;
+    if (opts.urlSubstring) frames = frames.filter((e) => (e.url ?? "").includes(opts.urlSubstring!));
+    if (opts.direction) frames = frames.filter((e) => e.direction === opts.direction);
+    if (opts.substring) frames = frames.filter((e) => e.payloadData.includes(opts.substring!));
+    if (opts.limit) frames = frames.slice(-opts.limit);
+    return frames;
+  }
+
+  clearWebSocketBuffer(): void {
+    this.webSocketBuffer = [];
+  }
+
+  clearProtocolBuffers(): void {
+    this.clearEventSourceBuffer();
+    this.clearWebSocketBuffer();
+  }
+
   private pushConsole(entry: ConsoleEntry): void {
     this.consoleBuffer.push(entry);
     if (this.consoleBuffer.length > MAX_CONSOLE) {
@@ -792,6 +922,20 @@ export class CometCDPClient {
     this.networkBuffer.push(entry);
     if (this.networkBuffer.length > MAX_NETWORK) {
       this.networkBuffer.splice(0, this.networkBuffer.length - MAX_NETWORK);
+    }
+  }
+
+  private pushEventSource(entry: EventSourceEntry): void {
+    this.eventSourceBuffer.push(entry);
+    if (this.eventSourceBuffer.length > MAX_EVENT_SOURCE) {
+      this.eventSourceBuffer.splice(0, this.eventSourceBuffer.length - MAX_EVENT_SOURCE);
+    }
+  }
+
+  private pushWebSocketFrame(entry: WebSocketFrameEntry): void {
+    this.webSocketBuffer.push(entry);
+    if (this.webSocketBuffer.length > MAX_WEBSOCKET) {
+      this.webSocketBuffer.splice(0, this.webSocketBuffer.length - MAX_WEBSOCKET);
     }
   }
 

@@ -24,14 +24,7 @@ export class McpSessionStore {
   }
 
   async has(sessionId: string): Promise<boolean> {
-    if (this.memorySessions.has(sessionId)) return true;
-    
-    if (this.redis) {
-      const exists = await this.redis.exists(`${REDIS_SESSION_PREFIX}${sessionId}`);
-      return exists === 1;
-    }
-    
-    return false;
+    return this.memorySessions.has(sessionId);
   }
 
   async register(sessionId: string, session: McpServerSession): Promise<void> {

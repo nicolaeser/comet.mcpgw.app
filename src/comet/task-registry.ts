@@ -401,21 +401,45 @@ export class TaskRegistry {
         await task.ai.setTabLabel(null);
       } catch {}
     }
+
     const targetId = task.client.targetId;
+    const childIds = task.client.childTargets;
+    const closedChildren: string[] = [];
+    for (const childId of childIds) {
+      try {
+        const ok = await task.client.closeTab(childId);
+        if (ok) closedChildren.push(childId);
+      } catch {
+
+      }
+    }
+
+    let closedOwned = false;
+    if (targetId && task.attachedKind === "new") {
+      try {
+        closedOwned = await task.client.closeTab(targetId);
+      } catch {
+
+      }
+    }
+
     try {
       await task.client.disconnect();
     } catch {
 
     }
-    if (targetId && task.attachedKind === "new") {
-      try {
-        await task.client.closeTab(targetId);
-      } catch {
 
-      }
-    }
     this.tasks.delete(id);
-    logger.info("Comet task closed", { taskId: id }, { privacySafe: true });
+    logger.info(
+      "Comet task closed",
+      {
+        taskId: id,
+        closedOwnedTab: closedOwned,
+        closedChildTabs: closedChildren.length,
+        attachedKind: task.attachedKind,
+      },
+      { privacySafe: true },
+    );
     return true;
   }
 

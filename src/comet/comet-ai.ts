@@ -1,4 +1,7 @@
-import type { CometCDPClient } from "./cdp-client.js";
+import type {
+  CometCDPClient,
+  WebSocketFrameEntry,
+} from "./cdp-client.js";
 
 const INPUT_SELECTORS = [
   '[contenteditable="true"]',
@@ -7,6 +10,22 @@ const INPUT_SELECTORS = [
   'textarea',
   'input[type="text"]',
 ];
+
+interface StreamSignals {
+  status: "idle" | "working" | "completed";
+  response: string;
+  steps: string[];
+  currentStep: string;
+  sawSse: boolean;
+  sawAgent: boolean;
+  textCompleted: boolean;
+  sseClosed: boolean;
+  eventCount: number;
+  lastEventAt?: number;
+  error?: string;
+  browserTool?: string;
+  agentAction?: string;
+}
 
 export class CometAI {
   private lastResponseText = "";
@@ -446,6 +465,101 @@ export class CometAI {
     this.stableResponseCount = 0;
   }
 
+  getStreamSignals(): StreamSignals {
+    const sseEvents = this.client
+      .getEventSourceEntries({ limit: 1000 })
+      .filter(
+        (entry) =>
+          !entry.url ||
+          entry.url.includes("/rest/sse/perplexity_ask") ||
+          entry.url.includes("/rest/sse/"),
+      );
+    const sseRequestIds = new Set(sseEvents.map((entry) => entry.requestId));
+    const sseNetworkEntries = this.client
+      .getNetworkEntries({
+        limit: 100,
+        urlSubstring: "/rest/sse/perplexity_ask",
+      })
+      .filter(
+        (entry) => sseRequestIds.size === 0 || sseRequestIds.has(entry.requestId),
+      );
+    const latestSseNetworkEntry = sseNetworkEntries.at(-1);
+
+    const allWsFrames = this.client.getWebSocketFrames({ limit: 250 });
+    const agentWsFrames = allWsFrames.filter(
+      (frame) => !frame.url || frame.url.includes("/agent"),
+    );
+    const wsFrames = agentWsFrames.length > 0 ? agentWsFrames : allWsFrames;
+
+    let textCompleted = false;
+    let sawAgent = wsFrames.length > 0;
+    let error: string | undefined;
+    let browserTool: string | undefined;
+    let agentAction: string | undefined;
+    const steps: string[] = [];
+    const responseCandidates: string[] = [];
+    const responseChunks: string[] = [];
+
+    for (const event of sseEvents) {
+      const parsed = parseJsonLike(event.data);
+      if (parsed === "[DONE]") {
+        textCompleted = true;
+        continue;
+      }
+      const signal = collectPayloadSignals(parsed);
+      if (signal.textCompleted) textCompleted = true;
+      if (signal.sawAgent) sawAgent = true;
+      if (signal.error && !error) error = signal.error;
+      if (signal.browserTool) browserTool = signal.browserTool;
+      if (signal.agentAction) agentAction = signal.agentAction;
+      steps.push(...signal.steps);
+      responseCandidates.push(...signal.responseCandidates);
+      responseChunks.push(...signal.responseChunks);
+    }
+
+    for (const frame of wsFrames) {
+      const signal = collectWebSocketSignals(frame);
+      if (signal.sawAgent) sawAgent = true;
+      if (signal.agentAction) agentAction = signal.agentAction;
+      if (signal.error && !error) error = signal.error;
+      steps.push(...signal.steps);
+    }
+
+    const response = selectBestResponse(responseCandidates, responseChunks);
+    const uniqueSteps = uniqueTail(steps.map(cleanStep).filter(Boolean), 5);
+    const currentStep =
+      uniqueSteps.at(-1) ||
+      cleanStep(agentAction) ||
+      cleanStep(browserTool) ||
+      "";
+    const sseClosed = Boolean(
+      latestSseNetworkEntry?.durationMs !== undefined || latestSseNetworkEntry?.failed,
+    );
+    const sawSse = sseEvents.length > 0;
+    const status =
+      textCompleted || sseClosed
+        ? "completed"
+        : sawSse || sawAgent
+        ? "working"
+        : "idle";
+
+    return {
+      status,
+      response,
+      steps: uniqueSteps,
+      currentStep,
+      sawSse,
+      sawAgent,
+      textCompleted,
+      sseClosed,
+      eventCount: sseEvents.length,
+      lastEventAt: sseEvents.at(-1)?.ts,
+      error,
+      browserTool,
+      agentAction,
+    };
+  }
+
   async acceptInFlowConfirmation(opts: { allowDestructive?: boolean } = {}): Promise<{
     clicked: boolean;
     kind: "browser_control" | "destructive" | null;
@@ -553,6 +667,18 @@ export class CometAI {
     awaitingInput: boolean;
     confirmationPrompt: string;
     confirmationKind: "browser_control" | "safe" | "destructive" | "unknown" | null;
+    stream: {
+      status: "idle" | "working" | "completed";
+      sawSse: boolean;
+      sawAgent: boolean;
+      textCompleted: boolean;
+      sseClosed: boolean;
+      eventCount: number;
+      responseLength: number;
+      currentStep: string;
+      lastEventAt?: number;
+      error?: string;
+    };
   }> {
     let agentBrowsingUrl = "";
     try {
@@ -876,21 +1002,68 @@ export class CometAI {
       confirmationKind: "browser_control" | "safe" | "destructive" | "unknown" | null;
     };
 
-    const isStable = this.isResponseStable(statusResult.response);
+    const stream = this.getStreamSignals();
+    let response = statusResult.response;
+    if (
+      stream.response &&
+      (!response || (stream.textCompleted && stream.response.length > response.length * 1.15))
+    ) {
+      response = stream.response;
+    }
+
+    const combinedSteps = uniqueTail(
+      [...statusResult.steps, ...stream.steps].map(cleanStep).filter(Boolean),
+      5,
+    );
+    const currentStep =
+      statusResult.currentStep || stream.currentStep || combinedSteps.at(-1) || "";
+
+    let combinedStatus = statusResult.status;
+    if (
+      stream.status === "completed" &&
+      !statusResult.awaitingInput &&
+      (response || !statusResult.hasStopButton)
+    ) {
+      combinedStatus = "completed";
+    } else if (
+      stream.status === "working" &&
+      combinedStatus === "idle" &&
+      !statusResult.awaitingInput
+    ) {
+      combinedStatus = "working";
+    }
+
+    const isStable = this.isResponseStable(response);
 
     if (
       isStable &&
-      statusResult.response.length > 50 &&
+      response.length > 50 &&
       !statusResult.hasStopButton &&
       !statusResult.awaitingInput
     ) {
-      statusResult.status = "completed";
+      combinedStatus = "completed";
     }
 
     return {
       ...statusResult,
+      status: combinedStatus,
+      steps: combinedSteps.length > 0 ? combinedSteps : statusResult.steps,
+      currentStep,
+      response,
       agentBrowsingUrl,
       isStable,
+      stream: {
+        status: stream.status,
+        sawSse: stream.sawSse,
+        sawAgent: stream.sawAgent,
+        textCompleted: stream.textCompleted,
+        sseClosed: stream.sseClosed,
+        eventCount: stream.eventCount,
+        responseLength: stream.response.length,
+        currentStep: stream.currentStep,
+        lastEventAt: stream.lastEventAt,
+        error: stream.error,
+      },
     };
   }
 
@@ -1064,4 +1237,207 @@ export class CometAI {
     `);
     return sel.result.value as { success: boolean; error?: string };
   }
+}
+
+interface PayloadSignals {
+  textCompleted: boolean;
+  sawAgent: boolean;
+  steps: string[];
+  responseCandidates: string[];
+  responseChunks: string[];
+  error?: string;
+  browserTool?: string;
+  agentAction?: string;
+}
+
+function emptyPayloadSignals(): PayloadSignals {
+  return {
+    textCompleted: false,
+    sawAgent: false,
+    steps: [],
+    responseCandidates: [],
+    responseChunks: [],
+  };
+}
+
+function parseJsonLike(value: string): unknown {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed === "[DONE]") return "[DONE]";
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return trimmed;
+  }
+}
+
+function collectWebSocketSignals(frame: WebSocketFrameEntry): PayloadSignals {
+  const parsed = parseJsonLike(frame.payloadData);
+  const signals = collectPayloadSignals(parsed);
+  if (frame.url?.includes("/agent")) {
+    signals.sawAgent = true;
+  }
+  return signals;
+}
+
+function collectPayloadSignals(value: unknown): PayloadSignals {
+  const out = emptyPayloadSignals();
+  visitPayload(value, [], out);
+  return out;
+}
+
+function visitPayload(
+  value: unknown,
+  path: string[],
+  out: PayloadSignals,
+): void {
+  if (value === null || value === undefined) return;
+
+  if (Array.isArray(value)) {
+    for (const item of value) visitPayload(item, path, out);
+    return;
+  }
+
+  if (typeof value !== "object") return;
+
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    const lowerKey = key.toLowerCase();
+    const nextPath = [...path, lowerKey];
+
+    if (lowerKey.includes("entropy_request") || lowerKey === "browser_tool") {
+      out.sawAgent = true;
+    }
+
+    if (
+      typeof child === "boolean" &&
+      (lowerKey === "text_completed" ||
+        lowerKey === "textcompleted" ||
+        lowerKey === "completed" ||
+        lowerKey === "done")
+    ) {
+      out.textCompleted = out.textCompleted || child;
+    }
+
+    if (typeof child === "string") {
+      const text = child.trim();
+      if (!text) continue;
+
+      if (lowerKey === "step_type") {
+        out.browserTool = text;
+        if (text === "ENTROPY_REQUEST") out.sawAgent = true;
+      } else if (lowerKey === "action") {
+        out.agentAction = text;
+        out.sawAgent = true;
+      } else if (lowerKey === "path" || lowerKey === "status" || lowerKey.includes("step")) {
+        if (text.length <= 200) out.steps.push(text);
+      } else if (lowerKey.includes("error")) {
+        out.error = out.error ?? text.substring(0, 500);
+      }
+
+      if (isLikelyResponseKey(lowerKey, nextPath) && isLikelyResponseText(text)) {
+        if (isChunkKey(lowerKey)) {
+          out.responseChunks.push(text);
+        } else {
+          out.responseCandidates.push(text);
+        }
+      }
+    }
+
+    visitPayload(child, nextPath, out);
+  }
+}
+
+function isLikelyResponseKey(key: string, path: string[]): boolean {
+  if (key === "text_completed") return false;
+  if (
+    key.includes("uuid") ||
+    key.endsWith("id") ||
+    key.includes("_id") ||
+    key.includes("url") ||
+    key.includes("slug") ||
+    key.includes("model") ||
+    key.includes("source") ||
+    key.includes("mode") ||
+    key.includes("header") ||
+    key.includes("path")
+  ) {
+    return false;
+  }
+
+  if (
+    [
+      "answer",
+      "content",
+      "delta",
+      "final_answer",
+      "markdown",
+      "message",
+      "output",
+      "response",
+      "text",
+      "token",
+    ].includes(key)
+  ) {
+    return true;
+  }
+
+  return path.some((part) =>
+    ["answer", "assistant", "content", "message", "response"].includes(part),
+  );
+}
+
+function isChunkKey(key: string): boolean {
+  return key === "delta" || key === "token";
+}
+
+function isLikelyResponseText(text: string): boolean {
+  if (text.length < 2) return false;
+  if (/^https?:\/\//i.test(text)) return false;
+  if (/^[a-f0-9-]{20,}$/i.test(text)) return false;
+  if (/^[A-Z_]+$/.test(text) && text.length < 40) return false;
+  if (/^[\[{].*[\]}]$/.test(text) && text.length > 500) return false;
+  return true;
+}
+
+function selectBestResponse(candidates: string[], chunks: string[]): string {
+  const bestCandidate =
+    candidates
+      .map(cleanResponse)
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)[0] ?? "";
+  const joinedChunks = cleanResponse(chunks.join(""));
+
+  if (!bestCandidate) return joinedChunks.substring(0, 32_000);
+  if (joinedChunks.length > bestCandidate.length * 2 && bestCandidate.length < 500) {
+    return joinedChunks.substring(0, 32_000);
+  }
+  return bestCandidate.substring(0, 32_000);
+}
+
+function cleanResponse(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim();
+}
+
+function cleanStep(step: string | undefined): string {
+  if (!step) return "";
+  return step
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .substring(0, 140);
+}
+
+function uniqueTail(values: string[], limit: number): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const value of values) {
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(value);
+  }
+  return unique.slice(-limit);
 }

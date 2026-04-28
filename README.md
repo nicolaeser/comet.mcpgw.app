@@ -243,6 +243,8 @@ Perplexity login flow. The first login always needs a real display.
 | `COMET_TASK_IDLE_SWEEP_MS` | `60000` | Idle sweeper cadence. |
 | `COMET_MAX_CONSOLE` | `500` | Per-task console buffer cap. |
 | `COMET_MAX_NETWORK` | `500` | Per-task network buffer cap. |
+| `COMET_MAX_EVENT_SOURCE` | `1000` | Per-task SSE message buffer cap for Comet answer-stream status. |
+| `COMET_MAX_WEBSOCKET` | `1000` | Per-task WebSocket frame buffer cap for Comet agent-channel status. |
 | `COMET_ENABLE_EVAL` | `false` | Turn on `comet_eval` (XSS-equivalent inside the tab). |
 
 ### Redis layout (when `REDIS_URL` is set)
@@ -267,8 +269,21 @@ Perplexity login flow. The first login always needs a real display.
 Drop more `.ts` files into `src/tools/...`, `src/resources/...`, or
 `src/prompts/...` and they are auto-registered at startup.
 
+### Workflow runners such as n8n
+
+For runners with short MCP/tool-call timeouts, submit Comet work without
+holding the call open:
+
+```json
+{ "prompt": "Use your browser to ...", "wait": false }
+```
+
+Then poll the returned `task_id` with `comet_poll` until it returns the final
+answer, or use `comet_get_response` for partial text. The bridge watches
+Comet's own `/rest/sse/perplexity_ask` stream and agent WebSocket frames via
+CDP, so status can keep moving even when DOM-based UI detection is brittle.
+
 ---
 
 > Built with help from Claude Code — yes, an MCP for Claude Code, built with Claude Code. 🤖
-
 
