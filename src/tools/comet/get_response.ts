@@ -30,10 +30,15 @@ const tool = defineTool({
         if (status.stream.sawSse) {
           lines.push(
             `Stream: ${status.stream.status.toUpperCase()} ` +
-              `(events=${status.stream.eventCount}, textCompleted=${status.stream.textCompleted ? "yes" : "no"})`,
+              `(requests=${status.stream.streamRequestCount}, chunks=${status.stream.sseChunkCount}, ` +
+              `bytes=${status.stream.sseBytes}, events=${status.stream.eventCount}, ` +
+              `textCompleted=${status.stream.textCompleted ? "yes" : "no"}, ` +
+              `active=${status.stream.sseActive ? "yes" : "no"})`,
           );
         } else if (status.stream.sawAgent) {
           lines.push("Stream: AGENT CHANNEL ACTIVE");
+        } else if (status.stream.sawWebSocket) {
+          lines.push("WebSocket: active (non-agent)");
         }
         if (status.currentStep) lines.push(`Current step: ${status.currentStep}`);
         lines.push("");

@@ -22,6 +22,7 @@ export interface CometTask {
 
   lock: Promise<void>;
   attachedKind: AttachedKind;
+  autoCloseOnCompletion?: boolean;
 }
 
 function isSidecarUrl(url: string): boolean {
@@ -415,7 +416,11 @@ export class TaskRegistry {
     }
 
     let closedOwned = false;
-    if (targetId && task.attachedKind === "new") {
+    if (
+      targetId &&
+      task.attachedKind === "new" &&
+      task.client.shouldCloseTargetOnTaskClose
+    ) {
       try {
         closedOwned = await task.client.closeTab(targetId);
       } catch {

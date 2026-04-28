@@ -1,5 +1,6 @@
 import type {
   CometCDPClient,
+  StreamRequestEntry,
   WebSocketFrameEntry,
 } from "./cdp-client.js";
 
@@ -17,11 +18,19 @@ interface StreamSignals {
   steps: string[];
   currentStep: string;
   sawSse: boolean;
+  sawEventSource: boolean;
   sawAgent: boolean;
+  sawWebSocket: boolean;
   textCompleted: boolean;
   sseClosed: boolean;
   eventCount: number;
+  streamRequestCount: number;
+  sseChunkCount: number;
+  sseBytes: number;
+  sseTextLength: number;
+  sseActive: boolean;
   lastEventAt?: number;
+  lastByteAt?: number;
   error?: string;
   browserTool?: string;
   agentAction?: string;
@@ -466,7 +475,7 @@ export class CometAI {
   }
 
   getStreamSignals(): StreamSignals {
-    const sseEvents = this.client
+    const eventSourceEvents = this.client
       .getEventSourceEntries({ limit: 1000 })
       .filter(
         (entry) =>
@@ -474,25 +483,30 @@ export class CometAI {
           entry.url.includes("/rest/sse/perplexity_ask") ||
           entry.url.includes("/rest/sse/"),
       );
-    const sseRequestIds = new Set(sseEvents.map((entry) => entry.requestId));
-    const sseNetworkEntries = this.client
-      .getNetworkEntries({
-        limit: 100,
-        urlSubstring: "/rest/sse/perplexity_ask",
-      })
+    const allStreamRequests = this.client
+      .getStreamRequestEntries({ limit: 20, urlSubstring: "/rest/sse/" })
       .filter(
-        (entry) => sseRequestIds.size === 0 || sseRequestIds.has(entry.requestId),
+        (entry) =>
+          entry.url.includes("/rest/sse/perplexity_ask") ||
+          entry.url.includes("/rest/sse/"),
       );
-    const latestSseNetworkEntry = sseNetworkEntries.at(-1);
-
-    const allWsFrames = this.client.getWebSocketFrames({ limit: 250 });
-    const agentWsFrames = allWsFrames.filter(
-      (frame) => !frame.url || frame.url.includes("/agent"),
+    const answerStreamRequests = allStreamRequests.filter((entry) =>
+      entry.url.includes("/rest/sse/perplexity_ask"),
     );
-    const wsFrames = agentWsFrames.length > 0 ? agentWsFrames : allWsFrames;
+    const streamRequests =
+      answerStreamRequests.length > 0 ? answerStreamRequests : allStreamRequests;
+    const latestStreamRequest = streamRequests.at(-1);
+    const ssePayloads = streamRequests.flatMap(extractSseDataPayloads);
+
+    const allWsFrames = this.client
+      .getWebSocketFrames({ limit: 250 })
+      .filter((frame) => !isSuggestionWebSocketUrl(frame.url));
+    const agentWsFrames = allWsFrames.filter(
+      (frame) => isAgentWebSocketUrl(frame.url) || !frame.url,
+    );
 
     let textCompleted = false;
-    let sawAgent = wsFrames.length > 0;
+    let sawAgent = false;
     let error: string | undefined;
     let browserTool: string | undefined;
     let agentAction: string | undefined;
@@ -500,7 +514,7 @@ export class CometAI {
     const responseCandidates: string[] = [];
     const responseChunks: string[] = [];
 
-    for (const event of sseEvents) {
+    for (const event of eventSourceEvents) {
       const parsed = parseJsonLike(event.data);
       if (parsed === "[DONE]") {
         textCompleted = true;
@@ -517,9 +531,26 @@ export class CometAI {
       responseChunks.push(...signal.responseChunks);
     }
 
-    for (const frame of wsFrames) {
-      const signal = collectWebSocketSignals(frame);
+    for (const payload of ssePayloads) {
+      const parsed = parseJsonLike(payload);
+      if (parsed === "[DONE]") {
+        textCompleted = true;
+        continue;
+      }
+      const signal = collectPayloadSignals(parsed);
+      if (signal.textCompleted) textCompleted = true;
       if (signal.sawAgent) sawAgent = true;
+      if (signal.error && !error) error = signal.error;
+      if (signal.browserTool) browserTool = signal.browserTool;
+      if (signal.agentAction) agentAction = signal.agentAction;
+      steps.push(...signal.steps);
+      responseCandidates.push(...signal.responseCandidates);
+      responseChunks.push(...signal.responseChunks);
+    }
+
+    for (const frame of agentWsFrames) {
+      const signal = collectWebSocketSignals(frame);
+      if (isAgentWebSocketUrl(frame.url) || signal.sawAgent) sawAgent = true;
       if (signal.agentAction) agentAction = signal.agentAction;
       if (signal.error && !error) error = signal.error;
       steps.push(...signal.steps);
@@ -532,12 +563,20 @@ export class CometAI {
       cleanStep(agentAction) ||
       cleanStep(browserTool) ||
       "";
-    const sseClosed = Boolean(
-      latestSseNetworkEntry?.durationMs !== undefined || latestSseNetworkEntry?.failed,
+    const sseClosed = Boolean(latestStreamRequest?.finished || latestStreamRequest?.failed);
+    const sawEventSource = eventSourceEvents.length > 0;
+    const sawSse = sawEventSource || streamRequests.length > 0;
+    const sseChunkCount = streamRequests.reduce((sum, entry) => sum + entry.chunkCount, 0);
+    const sseBytes = streamRequests.reduce((sum, entry) => sum + entry.dataLength, 0);
+    const sseTextLength = streamRequests.reduce((sum, entry) => sum + entry.textLength, 0);
+    const lastByteAt = streamRequests.reduce<number | undefined>(
+      (latest, entry) =>
+        entry.lastChunkAt && (!latest || entry.lastChunkAt > latest) ? entry.lastChunkAt : latest,
+      undefined,
     );
-    const sawSse = sseEvents.length > 0;
+    const sseActive = streamRequests.some((entry) => !entry.finished && !entry.failed);
     const status =
-      textCompleted || sseClosed
+      textCompleted || (sseClosed && Boolean(response))
         ? "completed"
         : sawSse || sawAgent
         ? "working"
@@ -549,12 +588,20 @@ export class CometAI {
       steps: uniqueSteps,
       currentStep,
       sawSse,
+      sawEventSource,
       sawAgent,
+      sawWebSocket: allWsFrames.length > 0,
       textCompleted,
       sseClosed,
-      eventCount: sseEvents.length,
-      lastEventAt: sseEvents.at(-1)?.ts,
-      error,
+      eventCount: eventSourceEvents.length + ssePayloads.length,
+      streamRequestCount: streamRequests.length,
+      sseChunkCount,
+      sseBytes,
+      sseTextLength,
+      sseActive,
+      lastEventAt: eventSourceEvents.at(-1)?.ts,
+      lastByteAt,
+      error: error ?? latestStreamRequest?.streamContentError,
       browserTool,
       agentAction,
     };
@@ -670,13 +717,21 @@ export class CometAI {
     stream: {
       status: "idle" | "working" | "completed";
       sawSse: boolean;
+      sawEventSource: boolean;
       sawAgent: boolean;
+      sawWebSocket: boolean;
       textCompleted: boolean;
       sseClosed: boolean;
       eventCount: number;
+      streamRequestCount: number;
+      sseChunkCount: number;
+      sseBytes: number;
+      sseTextLength: number;
+      sseActive: boolean;
       responseLength: number;
       currentStep: string;
       lastEventAt?: number;
+      lastByteAt?: number;
       error?: string;
     };
   }> {
@@ -1015,14 +1070,14 @@ export class CometAI {
       [...statusResult.steps, ...stream.steps].map(cleanStep).filter(Boolean),
       5,
     );
-    const currentStep =
-      statusResult.currentStep || stream.currentStep || combinedSteps.at(-1) || "";
+    let currentStep =
+      stream.currentStep || statusResult.currentStep || combinedSteps.at(-1) || "";
 
     let combinedStatus = statusResult.status;
     if (
       stream.status === "completed" &&
       !statusResult.awaitingInput &&
-      (response || !statusResult.hasStopButton)
+      Boolean(response)
     ) {
       combinedStatus = "completed";
     } else if (
@@ -1043,6 +1098,9 @@ export class CometAI {
     ) {
       combinedStatus = "completed";
     }
+    if (combinedStatus === "completed" && !statusResult.hasStopButton) {
+      currentStep = "";
+    }
 
     return {
       ...statusResult,
@@ -1055,13 +1113,21 @@ export class CometAI {
       stream: {
         status: stream.status,
         sawSse: stream.sawSse,
+        sawEventSource: stream.sawEventSource,
         sawAgent: stream.sawAgent,
+        sawWebSocket: stream.sawWebSocket,
         textCompleted: stream.textCompleted,
         sseClosed: stream.sseClosed,
         eventCount: stream.eventCount,
+        streamRequestCount: stream.streamRequestCount,
+        sseChunkCount: stream.sseChunkCount,
+        sseBytes: stream.sseBytes,
+        sseTextLength: stream.sseTextLength,
+        sseActive: stream.sseActive,
         responseLength: stream.response.length,
         currentStep: stream.currentStep,
         lastEventAt: stream.lastEventAt,
+        lastByteAt: stream.lastByteAt,
         error: stream.error,
       },
     };
@@ -1271,10 +1337,36 @@ function parseJsonLike(value: string): unknown {
   }
 }
 
+function extractSseDataPayloads(entry: StreamRequestEntry): string[] {
+  if (!entry.text) return [];
+  const out: string[] = [];
+  const normalized = entry.text.replace(/\r\n/g, "\n");
+  for (const block of normalized.split(/\n\n+/)) {
+    const dataLines: string[] = [];
+    for (const rawLine of block.split("\n")) {
+      const line = rawLine.trimEnd();
+      if (!line.startsWith("data:")) continue;
+      dataLines.push(line.slice(5).replace(/^ /, ""));
+    }
+    const payload = dataLines.join("\n").trim();
+    if (payload) out.push(payload);
+  }
+  return out;
+}
+
+function isSuggestionWebSocketUrl(url: string | undefined): boolean {
+  return Boolean(url && /suggest\.perplexity\.ai\/suggest\/ws/i.test(url));
+}
+
+function isAgentWebSocketUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  return /agent|entropy|browser|computer|chrome-extension/i.test(url);
+}
+
 function collectWebSocketSignals(frame: WebSocketFrameEntry): PayloadSignals {
   const parsed = parseJsonLike(frame.payloadData);
   const signals = collectPayloadSignals(parsed);
-  if (frame.url?.includes("/agent")) {
+  if (isAgentWebSocketUrl(frame.url)) {
     signals.sawAgent = true;
   }
   return signals;
@@ -1328,8 +1420,8 @@ function visitPayload(
       } else if (lowerKey === "action") {
         out.agentAction = text;
         out.sawAgent = true;
-      } else if (lowerKey === "path" || lowerKey === "status" || lowerKey.includes("step")) {
-        if (text.length <= 200) out.steps.push(text);
+      } else if (lowerKey === "status" || lowerKey.includes("step")) {
+        if (isLikelyStepSignal(text, lowerKey)) out.steps.push(text);
       } else if (lowerKey.includes("error")) {
         out.error = out.error ?? text.substring(0, 500);
       }
@@ -1396,6 +1488,15 @@ function isLikelyResponseText(text: string): boolean {
   if (/^[a-f0-9-]{20,}$/i.test(text)) return false;
   if (/^[A-Z_]+$/.test(text) && text.length < 40) return false;
   if (/^[\[{].*[\]}]$/.test(text) && text.length > 500) return false;
+  return true;
+}
+
+function isLikelyStepSignal(text: string, key: string): boolean {
+  if (text.length > 160) return false;
+  if (text.startsWith("/")) return false;
+  if (key === "status") {
+    return /^[A-Za-z][A-Za-z0-9 _-]{1,80}$/.test(text);
+  }
   return true;
 }
 

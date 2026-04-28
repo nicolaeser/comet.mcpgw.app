@@ -35,10 +35,10 @@ concurrent tasks cannot stomp on each other.
 
 ## Quick start
 
-```bash
-# 1. Run Comet on your workstation with --remote-debugging-port=9222
+Run Comet on your workstation with `--remote-debugging-port=9222`, then start
+the bridge:
 
-# 2. Boot the bridge
+```bash
 docker compose up -d
 ```
 
@@ -85,7 +85,7 @@ npm run dev
 **Driving Perplexity**
 | Tool | What it does |
 |------|--------------|
-| `comet_ask` | Send a prompt and wait for the answer. Supports `closeAfter`, `closeTimeout`, multi-step continuation. Parallel-safe across distinct `task_id`s. |
+| `comet_ask` | Send a prompt and wait for the answer. Completed one-shot tasks auto-close by default; pass `closeAfter=false` for follow-up/inspection. Parallel-safe across distinct `task_id`s. |
 | `comet_poll` | Non-blocking status check; returns the response when COMPLETED. |
 | `comet_get_response` | Peek at the latest visible answer without waiting. |
 | `comet_stop` | Click Perplexity's Stop button. |
@@ -123,6 +123,20 @@ npm run dev
 | `comet_set_viewport` | Override device metrics (mobile emulation). |
 | `comet_block_urls` | `Network.setBlockedURLs` patterns. |
 | `comet_clear_cache` | Browser-wide resets. |
+
+---
+
+## Task lifecycle defaults
+
+`comet_ask` auto-closes completed one-shot task tabs by default. A task stays
+open when Comet is still working, waiting for confirmation, or when the caller
+passes `closeAfter=false`. `closeTimeout` can be used to keep a completed tab
+available briefly for inspection before it closes.
+
+For asynchronous clients such as n8n, call `comet_ask` with `wait=false`, then
+poll with `comet_poll`. The task inherits the same auto-close preference and
+will close when `comet_poll` observes completion unless `closeAfter=false` was
+set on the ask or poll call.
 
 ---
 
@@ -243,7 +257,9 @@ Perplexity login flow. The first login always needs a real display.
 | `COMET_TASK_IDLE_SWEEP_MS` | `60000` | Idle sweeper cadence. |
 | `COMET_MAX_CONSOLE` | `500` | Per-task console buffer cap. |
 | `COMET_MAX_NETWORK` | `500` | Per-task network buffer cap. |
-| `COMET_MAX_EVENT_SOURCE` | `1000` | Per-task SSE message buffer cap for Comet answer-stream status. |
+| `COMET_MAX_EVENT_SOURCE` | `1000` | Per-task browser `EventSource` message buffer cap. Comet usually uses fetch-backed SSE, so this is mostly a fallback. |
+| `COMET_MAX_STREAM_REQUESTS` | `100` | Per-task fetch-backed SSE request buffer cap. |
+| `COMET_MAX_STREAM_TEXT` | `250000` | Max decoded SSE text kept per streamed request. |
 | `COMET_MAX_WEBSOCKET` | `1000` | Per-task WebSocket frame buffer cap for Comet agent-channel status. |
 | `COMET_ENABLE_EVAL` | `false` | Turn on `comet_eval` (XSS-equivalent inside the tab). |
 
@@ -279,11 +295,8 @@ holding the call open:
 ```
 
 Then poll the returned `task_id` with `comet_poll` until it returns the final
-answer, or use `comet_get_response` for partial text. The bridge watches
-Comet's own `/rest/sse/perplexity_ask` stream and agent WebSocket frames via
-CDP, so status can keep moving even when DOM-based UI detection is brittle.
-
----
-
-> Built with help from Claude Code — yes, an MCP for Claude Code, built with Claude Code. 🤖
-
+answer, or use `comet_get_response` for partial text. Completed tasks close
+automatically when `comet_poll` observes completion unless `closeAfter=false`
+is set. The bridge watches Comet's `/rest/sse/perplexity_ask` stream and agent
+signals via CDP, so status can keep moving even when DOM-based UI detection is
+brittle.

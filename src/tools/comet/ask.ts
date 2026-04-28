@@ -8,6 +8,15 @@ const IDLE_TIMEOUT_MS = 6_000;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const AWAITING_INPUT_GRACE_MS = 8_000;
 
+function wantsCloseAfterCompleted(
+  closeAfter: boolean | undefined,
+  keepAlive: boolean,
+): boolean {
+  if (closeAfter === true) return true;
+  if (closeAfter === false) return false;
+  return !keepAlive;
+}
+
 function normalizePrompt(raw: string): string {
   return raw
     .replace(/^[-*•]\s*/gm, "")
@@ -40,7 +49,7 @@ function transformForAgentic(prompt: string): string {
 const tool = defineTool({
   name: "comet_ask",
   title: "Ask Comet",
-  description: "Send a prompt to Comet/Perplexity and wait for the response. If `task_id` is omitted, reuses the most-recently-used task or auto-creates one (so you do NOT need to call comet_connect first — just call comet_ask). Tasks persist across calls: passing the same task_id continues the conversation in the same tab; omitting task_id reuses the existing tab instead of opening a new one. Multiple comet_ask calls can run in parallel as long as each targets a different task_id. Set `newChat=true` to start a fresh conversation in the same tab, or `closeAfter=true` to auto-close after the response (one-shot). Use comet_task_close to stop a multi-step task explicitly.",
+  description: "Send a prompt to Comet/Perplexity and wait for the response. If `task_id` is omitted, reuses the most-recently-used task or auto-creates one (so you do NOT need to call comet_connect first — just call comet_ask). Multiple comet_ask calls can run in parallel as long as each targets a different task_id. By default, completed one-shot tasks auto-close their task tab; pass `closeAfter=false` to keep the tab for follow-up work or inspection. The tab is kept open when Comet is still working or waiting for user/agent confirmation. Use comet_task_close to stop a multi-step task explicitly.",
   rateLimit: { tool: { max: 30 }, client: { max: 10 } },
   annotations: {
     readOnlyHint: false,
@@ -70,11 +79,12 @@ const tool = defineTool({
       .describe("Max wait time in ms (safety net; idle-detection usually returns sooner)"),
     closeAfter: z
       .boolean()
-      .default(false)
+      .optional()
       .describe(
-        "If true, close the task (and its tab) after the response is returned. " +
-          "Use for one-shot questions. Leave false (default) for multi-step tasks " +
-          "that will receive follow-up comet_ask calls.",
+        "Whether to close the task (and its tab) after a completed response. " +
+          "Defaults to auto-close for completed one-shot work. Set false to keep " +
+          "the tab open for follow-up prompts or inspection. The bridge never " +
+          "auto-closes while Comet is still working or awaiting confirmation.",
       ),
     closeTimeout: z
       .number()
@@ -83,12 +93,12 @@ const tool = defineTool({
       .max(3_600_000)
       .default(0)
       .describe(
-        "Only meaningful when closeAfter=true. Milliseconds to wait after the " +
-          "response is returned before closing the task's tab. 0 (default) closes " +
-          "immediately. Useful when downstream tools (comet_screenshot, comet_html, " +
-          "comet_console, etc.) need a brief window to inspect the tab before it " +
-          "goes away. The close runs in the background — comet_ask returns as soon " +
-          "as the response is ready, regardless of this value.",
+        "Milliseconds to wait after a completed response before auto-closing " +
+          "the task's tab. 0 (default) closes immediately. Useful when downstream " +
+          "tools (comet_screenshot, comet_html, comet_console, etc.) need a brief " +
+          "window to inspect the tab before it goes away. Ignored when closeAfter=false " +
+          "or when Comet is still working/awaiting confirmation. The close runs in " +
+          "the background — comet_ask returns as soon as the response is ready.",
       ),
     wait: z
       .boolean()
@@ -112,6 +122,12 @@ const tool = defineTool({
 
     let resolvedTaskId: string | null = null;
     let effectiveTaskId = task_id;
+    let shouldCloseResolvedTask = false;
+    const markCloseAfterCompleted = (keepAlive: boolean) => {
+      if (wantsCloseAfterCompleted(closeAfter, keepAlive)) {
+        shouldCloseResolvedTask = true;
+      }
+    };
     try {
       if (!effectiveTaskId) {
         const existing = taskRegistry.resolveOrNull();
@@ -131,6 +147,7 @@ const tool = defineTool({
       const result = await taskRegistry.withTask(effectiveTaskId, async (task) => {
         resolvedTaskId = task.id;
         const { client, ai } = task;
+        task.autoCloseOnCompletion = wantsCloseAfterCompleted(closeAfter, task.keepAlive);
 
         if (!client.isConnected) {
           await client.ensureConnection();
@@ -179,6 +196,9 @@ const tool = defineTool({
                   "Status: WORKING",
                   "",
                   `Poll with comet_poll task_id=${task.id}.`,
+                  task.autoCloseOnCompletion
+                    ? "The task will auto-close when comet_poll observes completion."
+                    : "The task will stay open after completion.",
                   `Peek partial text with comet_get_response task_id=${task.id}.`,
                 ].join("\n"),
               },
@@ -187,6 +207,7 @@ const tool = defineTool({
               task_id: task.id,
               status: "working",
               submitted: true,
+              auto_close_on_completion: task.autoCloseOnCompletion,
             },
           };
         }
@@ -289,6 +310,7 @@ const tool = defineTool({
             );
 
             if (status.status === "completed" && sawNewResponse && status.response) {
+              markCloseAfterCompleted(task.keepAlive);
               return textResult(status.response);
             }
             if (
@@ -298,6 +320,7 @@ const tool = defineTool({
               !status.hasStopButton &&
               !status.awaitingInput
             ) {
+              markCloseAfterCompleted(task.keepAlive);
               return textResult(status.response);
             }
             if (
@@ -322,6 +345,7 @@ const tool = defineTool({
               !status.hasStopButton &&
               !status.awaitingInput
             ) {
+              markCloseAfterCompleted(task.keepAlive);
               return textResult(status.response);
             }
           } catch (err) {
@@ -350,6 +374,9 @@ const tool = defineTool({
 
         const finalStatus = await ai.getAgentStatus();
         if (finalStatus.response && !finalStatus.awaitingInput) {
+          if (finalStatus.status === "completed" && !finalStatus.hasStopButton) {
+            markCloseAfterCompleted(task.keepAlive);
+          }
           return textResult(finalStatus.response);
         }
 
@@ -360,8 +387,15 @@ const tool = defineTool({
         if (finalStatus.stream.sawSse) {
           lines.push(
             `Stream: ${finalStatus.stream.status.toUpperCase()} ` +
-              `(events=${finalStatus.stream.eventCount}, textCompleted=${finalStatus.stream.textCompleted ? "yes" : "no"})`,
+              `(requests=${finalStatus.stream.streamRequestCount}, chunks=${finalStatus.stream.sseChunkCount}, ` +
+              `bytes=${finalStatus.stream.sseBytes}, events=${finalStatus.stream.eventCount}, ` +
+              `textCompleted=${finalStatus.stream.textCompleted ? "yes" : "no"}, ` +
+              `active=${finalStatus.stream.sseActive ? "yes" : "no"})`,
           );
+        } else if (finalStatus.stream.sawAgent) {
+          lines.push("Stream: AGENT CHANNEL ACTIVE");
+        } else if (finalStatus.stream.sawWebSocket) {
+          lines.push("WebSocket: active (non-agent)");
         }
         if (finalStatus.awaitingInput && finalStatus.confirmationPrompt) {
           lines.push(`Awaiting: ${finalStatus.confirmationPrompt}`);
@@ -383,7 +417,7 @@ const tool = defineTool({
         `comet_ask failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
-      if (wait && closeAfter && resolvedTaskId) {
+      if (wait && shouldCloseResolvedTask && resolvedTaskId) {
         const id = resolvedTaskId;
         const fire = () => {
           void taskRegistry.close(id).catch(() => {});

@@ -27,18 +27,19 @@ const prompt = definePrompt({
     lines.push("");
     lines.push("Step 1 — fan out connects (issue these in parallel):");
     list.forEach((q, i) => {
-      lines.push(`  comet_connect — { "label": "q${i + 1}" }   // capture task_id_${i + 1}`);
+      lines.push(`  comet_connect — { "label": "q${i + 1}" }`);
+      lines.push(`  Capture the returned task_id as id_${i + 1}.`);
     });
     lines.push("");
     lines.push("Step 2 — fan out asks in parallel (one task_id per ask):");
     list.forEach((q, i) => {
       lines.push(
-        `  comet_ask — { "task_id": "<id_${i + 1}>", "prompt": ${JSON.stringify(q)}, "newChat": true, "closeAfter": true, "timeout": 90000 }`,
+        `  comet_ask — { "task_id": "<id_${i + 1}>", "prompt": ${JSON.stringify(q)}, "newChat": true, "timeout": 90000 }`,
       );
     });
     lines.push("");
     lines.push("Each comet_ask runs in its own Comet tab — they do not share state.");
-    lines.push("closeAfter=true makes the tabs self-clean after the response is returned.");
+    lines.push("Completed one-shot asks self-clean by default. Add closeAfter=false if you need to inspect or continue a tab.");
     lines.push("");
     lines.push("Step 3 — present the answers as a numbered list, one per question.");
     lines.push("If any task returns 'still in progress', poll with comet_poll task_id=… every 3s.");

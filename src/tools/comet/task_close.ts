@@ -6,7 +6,7 @@ import { errorResult, textResult } from "../_shared/tool-result.js";
 const tool = defineTool({
   name: "comet_task_close",
   title: "Close a Comet task",
-  description: "Tear down a task: waits for any in-flight tool call against it to finish, then detaches the CDP socket and closes the underlying Comet tab. Pass `all=true` to close every active task at once. Idempotent — closing a non-existent task_id returns a notice, not an error. Equivalent to setting closeAfter=true on the previous comet_ask, but explicit.",
+  description: "Tear down a task: waits for any in-flight tool call against it to finish, then detaches the CDP socket and closes the underlying Comet tab. Pass `all=true` to close every active task at once. Idempotent — closing a non-existent task_id returns a notice, not an error. Use this for explicit cleanup when a task was kept open with closeAfter=false or is still in progress.",
   rateLimit: { tool: { max: 30 } },
   annotations: {
     readOnlyHint: false,

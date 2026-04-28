@@ -18,13 +18,31 @@ const tool = defineTool({
       .string()
       .optional()
       .describe("Task to poll. Required when more than one task is active."),
+    closeAfter: z
+      .boolean()
+      .optional()
+      .describe(
+        "Whether to close the task after this poll observes a completed response. " +
+          "Defaults to the preference set by comet_ask; otherwise completed tasks " +
+          "auto-close unless the task was created with keepAlive=true.",
+      ),
   },
-  async execute({ task_id }) {
+  async execute({ task_id, closeAfter }) {
     try {
       return await taskRegistry.withTask(task_id, async (task) => {
         const status = await task.ai.getAgentStatus();
 
         if (status.status === "completed" && status.response && !status.awaitingInput) {
+          const shouldClose =
+            closeAfter === true ||
+            (closeAfter === undefined &&
+              (task.autoCloseOnCompletion ?? !task.keepAlive));
+          if (shouldClose) {
+            const id = task.id;
+            setImmediate(() => {
+              void taskRegistry.close(id).catch(() => {});
+            });
+          }
           return textResult(status.response);
         }
 
@@ -35,10 +53,15 @@ const tool = defineTool({
         if (status.stream.sawSse) {
           lines.push(
             `Stream: ${status.stream.status.toUpperCase()} ` +
-              `(events=${status.stream.eventCount}, textCompleted=${status.stream.textCompleted ? "yes" : "no"})`,
+              `(requests=${status.stream.streamRequestCount}, chunks=${status.stream.sseChunkCount}, ` +
+              `bytes=${status.stream.sseBytes}, events=${status.stream.eventCount}, ` +
+              `textCompleted=${status.stream.textCompleted ? "yes" : "no"}, ` +
+              `active=${status.stream.sseActive ? "yes" : "no"})`,
           );
         } else if (status.stream.sawAgent) {
           lines.push("Stream: AGENT CHANNEL ACTIVE");
+        } else if (status.stream.sawWebSocket) {
+          lines.push("WebSocket: active (non-agent)");
         }
         if (status.stream.error) lines.push(`Stream error: ${status.stream.error}`);
         if (status.awaitingInput) {
