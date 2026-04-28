@@ -10,6 +10,7 @@ import type {
 
 const HTTP_TIMEOUT_MS = 5_000;
 const HEALTH_CHECK_TIMEOUT_MS = 3_000;
+const EVALUATE_TIMEOUT_MS = Number(process.env.COMET_EVALUATE_TIMEOUT_MS ?? 8_000);
 
 export interface CDPConfig {
   cdpHost: string;
@@ -281,13 +282,23 @@ export class CometCDPClient {
     ]);
 
     try {
-      this.client.Page.loadEventFired(() => {
+      const fireLoadCbs = () => {
         for (const cb of this.mainFrameLoadCbs) {
           try {
             cb();
           } catch {}
         }
-      });
+      };
+      this.client.Page.loadEventFired(fireLoadCbs);
+      try {
+        const page = this.client.Page as unknown as {
+          frameNavigated: (cb: (params: { frame: { id: string; parentId?: string; url: string } }) => void) => void;
+        };
+        page.frameNavigated((params) => {
+          if (params.frame.parentId) return;
+          fireLoadCbs();
+        });
+      } catch {}
     } catch {}
 
     try {
@@ -433,6 +444,7 @@ export class CometCDPClient {
     this.client = null;
     this.state.connected = false;
     this.state.activeTabId = undefined;
+    this.networkInFlight.clear();
   }
 
   async reconnect(): Promise<string> {
@@ -526,6 +538,27 @@ export class CometCDPClient {
         this.isReconnecting = false;
       }
     }
+  }
+
+  async addScriptToEvaluateOnNewDocument(source: string): Promise<string | null> {
+    this.ensureClient();
+    try {
+      const r = (await (this.client!.Page as unknown as {
+        addScriptToEvaluateOnNewDocument: (p: { source: string }) => Promise<{ identifier: string }>;
+      }).addScriptToEvaluateOnNewDocument({ source })) as { identifier: string };
+      return r.identifier ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async removeScriptToEvaluateOnNewDocument(identifier: string): Promise<void> {
+    this.ensureClient();
+    try {
+      await (this.client!.Page as unknown as {
+        removeScriptToEvaluateOnNewDocument: (p: { identifier: string }) => Promise<void>;
+      }).removeScriptToEvaluateOnNewDocument({ identifier });
+    } catch {}
   }
 
   async navigate(url: string, waitForLoad = true): Promise<NavigateResult> {
@@ -764,11 +797,20 @@ export class CometCDPClient {
 
   async evaluate(expression: string): Promise<EvaluateResult> {
     this.ensureClient();
-    return (await this.client!.Runtime.evaluate({
+    const evalPromise = this.client!.Runtime.evaluate({
       expression,
       awaitPromise: true,
       returnByValue: true,
-    })) as EvaluateResult;
+    }) as Promise<EvaluateResult>;
+    return Promise.race([
+      evalPromise,
+      new Promise<EvaluateResult>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Runtime.evaluate timed out after ${EVALUATE_TIMEOUT_MS}ms`)),
+          EVALUATE_TIMEOUT_MS,
+        ),
+      ),
+    ]);
   }
 
   async safeEvaluate(expression: string): Promise<EvaluateResult> {

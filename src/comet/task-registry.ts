@@ -29,7 +29,8 @@ function isSidecarUrl(url: string): boolean {
 }
 
 function isThreadUrl(url: string): boolean {
-  return /(^|\.)perplexity\.ai\//.test(url) && !isSidecarUrl(url);
+  if (isSidecarUrl(url)) return false;
+  return /perplexity\.ai\/(search|thread)\//.test(url);
 }
 
 export interface AttachableTarget {
@@ -139,6 +140,7 @@ export class TaskRegistry {
 
   private readonly idleTtlMs = envIntMs("COMET_TASK_IDLE_TTL_MS", 30 * 60 * 1000);
   private readonly idleSweepMs = envIntMs("COMET_TASK_IDLE_SWEEP_MS", 60 * 1000);
+  private readonly autoSidecarWaitMs = envIntMs("COMET_AUTO_SIDECAR_WAIT_MS", 2_000);
 
   async create(
     label?: string,
@@ -188,9 +190,29 @@ export class TaskRegistry {
         }
         throw new Error(lines.join("\n"));
       } else if (attachMode === "auto") {
-        const tab = await cdpNewTab("https://www.perplexity.ai/");
-        await new Promise((r) => setTimeout(r, 800));
-        targetId = tab.id;
+        const deadline = Date.now() + this.autoSidecarWaitMs;
+        let attached: { id: string; kind: AttachedKind } | null = null;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 250));
+          const retry = await findPerplexityTarget("auto", {
+            urlContains: opts.urlContains,
+            titleContains: opts.titleContains,
+            ownedTabIds,
+          });
+          if (retry && "id" in retry) {
+            attached = { id: retry.id, kind: retry.kind };
+            break;
+          }
+        }
+        if (attached) {
+          targetId = attached.id;
+          attachedKind = attached.kind;
+        } else {
+          await report(0, "no existing Perplexity surface — opening fresh tab");
+          const tab = await cdpNewTab("https://www.perplexity.ai/");
+          await new Promise((r) => setTimeout(r, 800));
+          targetId = tab.id;
+        }
       } else {
         throw new Error(
           `No existing Comet ${attachMode} target found. ` +

@@ -15,11 +15,24 @@ export class CometAI {
 
   private pinnedLabel: string | null = null;
   private unsubLoadEvent: (() => void) | null = null;
+  private titleHookScriptId: string | null = null;
 
   constructor(private readonly client: CometCDPClient) {}
 
   async setTabLabel(label: string | null): Promise<void> {
     this.pinnedLabel = label || null;
+
+    if (this.pinnedLabel) {
+      if (this.titleHookScriptId === null) {
+        this.titleHookScriptId = await this.client.addScriptToEvaluateOnNewDocument(
+          this.titleHookSource(),
+        );
+      }
+    } else if (this.titleHookScriptId !== null) {
+      await this.client.removeScriptToEvaluateOnNewDocument(this.titleHookScriptId);
+      this.titleHookScriptId = null;
+    }
+
     await this.applyTabLabel(this.pinnedLabel);
 
     if (this.pinnedLabel && !this.unsubLoadEvent) {
@@ -35,33 +48,127 @@ export class CometAI {
     }
   }
 
+  private titleHookSource(): string {
+    return `
+      (() => {
+        const w = window;
+        if (w.__cometTitleHook) return;
+        try {
+          const desc = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
+          if (!desc || typeof desc.set !== 'function' || typeof desc.get !== 'function') return;
+          const realSet = desc.set;
+          const realGet = desc.get;
+          w.__cometTitleRealSet = realSet;
+          w.__cometTitleRealGet = realGet;
+          const stripExisting = (t) => (t || '').replace(/^\\s*\\[[^\\]]+\\]\\s*/, '');
+          Object.defineProperty(Document.prototype, 'title', {
+            configurable: true,
+            enumerable: desc.enumerable,
+            get: function () { return realGet.call(this); },
+            set: function (v) {
+              const p = w.__cometLabel || '';
+              const stripped = stripExisting(String(v == null ? '' : v));
+              const wanted = p ? p + ' ' + stripped : stripped;
+              realSet.call(this, wanted);
+            },
+          });
+          w.__cometTitleHook = true;
+        } catch {}
+      })();
+    `;
+  }
+
   private async applyTabLabel(label: string | null): Promise<void> {
     const prefix = label ? `[${label}]` : "";
+    const intervalMs = (() => {
+      const raw = process.env.COMET_LABEL_REPAIR_MS;
+      const n = raw ? Number(raw) : NaN;
+      return Number.isFinite(n) && n >= 200 ? Math.floor(n) : 750;
+    })();
     await this.client.evaluate(`
       (() => {
         const prefix = ${JSON.stringify(prefix)};
+        const intervalMs = ${intervalMs};
         const w = window;
         if (w.__cometLabelObs) { try { w.__cometLabelObs.disconnect(); } catch {} }
+        if (w.__cometLabelHeadObs) { try { w.__cometLabelHeadObs.disconnect(); } catch {} }
+        if (w.__cometLabelTimer) { try { clearInterval(w.__cometLabelTimer); } catch {} }
         w.__cometLabel = prefix;
 
         const stripExisting = (t) => (t || '').replace(/^\\s*\\[[^\\]]+\\]\\s*/, '');
+
+        if (!w.__cometTitleHook) {
+          try {
+            const desc = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
+            if (desc && typeof desc.set === 'function' && typeof desc.get === 'function') {
+              const realSet = desc.set;
+              const realGet = desc.get;
+              w.__cometTitleRealSet = realSet;
+              w.__cometTitleRealGet = realGet;
+              Object.defineProperty(Document.prototype, 'title', {
+                configurable: true,
+                enumerable: desc.enumerable,
+                get: function () { return realGet.call(this); },
+                set: function (v) {
+                  const p = w.__cometLabel || '';
+                  const stripped = stripExisting(String(v == null ? '' : v));
+                  const wanted = p ? p + ' ' + stripped : stripped;
+                  realSet.call(this, wanted);
+                },
+              });
+              w.__cometTitleHook = true;
+            }
+          } catch {}
+        }
+
         const apply = () => {
           const stripped = stripExisting(document.title);
           const wanted = prefix ? prefix + ' ' + stripped : stripped;
-          if (document.title !== wanted) document.title = wanted;
+          if (document.title !== wanted) {
+            if (w.__cometTitleRealSet) {
+              try { w.__cometTitleRealSet.call(document, wanted); return; } catch {}
+            }
+            document.title = wanted;
+          }
         };
         apply();
         if (!prefix) return true;
 
-        const titleEl = document.querySelector('title');
-        const head = document.querySelector('head');
+        const head = document.head || document.querySelector('head');
         if (!head) return false;
-        const obs = new MutationObserver(() => {
+
+        let titleObs = null;
+        const bindTitle = () => {
+          if (titleObs) { try { titleObs.disconnect(); } catch {} }
+          const el = document.querySelector('title');
+          if (!el) return;
+          titleObs = new MutationObserver(() => {
+            if (!document.title.startsWith(prefix)) apply();
+          });
+          titleObs.observe(el, { childList: true, characterData: true, subtree: true });
+          w.__cometLabelObs = titleObs;
+        };
+        bindTitle();
+
+        const headObs = new MutationObserver((records) => {
+          for (const r of records) {
+            for (const n of r.addedNodes) {
+              if (n.nodeName === 'TITLE') { bindTitle(); break; }
+            }
+            for (const n of r.removedNodes) {
+              if (n.nodeName === 'TITLE') { bindTitle(); break; }
+            }
+          }
           if (!document.title.startsWith(prefix)) apply();
         });
-        if (titleEl) obs.observe(titleEl, { childList: true, characterData: true, subtree: true });
-        obs.observe(head, { childList: true, subtree: true });
-        w.__cometLabelObs = obs;
+        headObs.observe(head, { childList: true });
+        w.__cometLabelHeadObs = headObs;
+
+        w.__cometLabelTimer = setInterval(() => {
+          if (w.__cometLabel !== prefix) return;
+          if (!document.title.startsWith(prefix)) apply();
+        }, intervalMs);
+
         return true;
       })()
     `);
@@ -392,24 +499,10 @@ export class CometAI {
   }
 
   async acceptBrowserControlBanner(): Promise<boolean> {
+    const inFlow = await this.acceptInFlowConfirmation({ allowDestructive: false });
+    if (inFlow.clicked) return true;
     const result = await this.client.evaluate(`
       (() => {
-        const allowTexts = [
-          'allow once', 'allow this time', 'allow',
-          'einmal erlauben', 'erlauben', 'zulassen',
-        ];
-
-        const visibleButtons = [...document.querySelectorAll('button')]
-          .filter((btn) => !btn.disabled && btn.offsetParent !== null);
-
-        for (const btn of visibleButtons) {
-          const t = (btn.innerText || '').trim().toLowerCase();
-          if (allowTexts.some((a) => t === a || t === a + '.' || t.startsWith(a))) {
-            btn.click();
-            return true;
-          }
-        }
-
         for (const useEl of document.querySelectorAll('svg use')) {
           const href = useEl.getAttribute('xlink:href') || useEl.getAttribute('href');
           if (href !== '#pplx-icon-click') continue;
@@ -607,9 +700,19 @@ export class CometAI {
         ];
         const hasWorkingText = workingPatterns.some(p => body.includes(p));
 
+        const declinePatterns = [
+          'Cancelled', 'Canceled', 'Declined', 'Denied', 'Action declined',
+          'Permission denied', 'Stopped by user',
+          'Abgebrochen', 'Abgelehnt', 'Verweigert',
+        ];
+        const declineHit = declinePatterns.find((p) => body.includes(p));
+        const wasDeclined = Boolean(declineHit) && !hasActiveStopButton && !hasLoadingSpinner;
+
         let status = 'idle';
 
-        if (awaitingInput && !hasLoadingSpinner && !hasThinkingIndicator) {
+        if (wasDeclined) {
+          status = 'completed';
+        } else if (awaitingInput && !hasLoadingSpinner && !hasThinkingIndicator) {
           status = 'awaiting_input';
         } else if (hasActiveStopButton) {
           status = 'working';
@@ -702,6 +805,10 @@ export class CometAI {
             if (validTexts.length > 0) {
               response = validTexts.slice(-3).join('\\n\\n');
             }
+          }
+
+          if (wasDeclined && (!response || response.length < 5)) {
+            response = 'Comet reported: ' + declineHit;
           }
 
           if (response) {

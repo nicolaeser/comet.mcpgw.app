@@ -134,6 +134,7 @@ const tool = defineTool({
         ai.resetStabilityTracking();
 
         const before = await ai.getAnswerSnapshot();
+        const beforeKey = `${before.count}|${before.lastLength}|${before.lastText}`;
 
         await ai.sendPrompt(finalPrompt);
 
@@ -152,9 +153,15 @@ const tool = defineTool({
         let bannerAccepted = false;
         let awaitingInputSince: number | null = null;
         let lastConfirmationPrompt = "";
+        let previousAwaiting = false;
+
+        const stopOnAbort = async () => {
+          try { await ai.stopAgent(); } catch {}
+        };
 
         while (Date.now() - start < timeout) {
           if (ctx.abortSignal.aborted) {
+            await stopOnAbort();
             return errorResult(`comet_ask was cancelled (task ${task.id})`);
           }
 
@@ -181,29 +188,28 @@ const tool = defineTool({
               }
             }
 
-            try {
-              const auto = await ai.acceptInFlowConfirmation({ allowDestructive: false });
-              if (auto.clicked) {
-                lastActivityTime = Date.now();
-                awaitingInputSince = null;
+            if (previousAwaiting) {
+              try {
+                const auto = await ai.acceptInFlowConfirmation({ allowDestructive: false });
+                if (auto.clicked) {
+                  lastActivityTime = Date.now();
+                  awaitingInputSince = null;
+                }
+              } catch {
+
               }
-            } catch {
-
             }
 
-            const current = await client.withAutoReconnect(async () => ai.getAnswerSnapshot());
-
-            if (
-              !sawNewResponse &&
-              (current.count > before.count ||
-                current.lastLength > before.lastLength ||
-                (current.lastText && current.lastText !== before.lastText))
-            ) {
-              sawNewResponse = true;
-            }
-
-            const status = await ai.getAgentStatus();
+            const status = await client.withAutoReconnect(async () => ai.getAgentStatus());
             consecutiveErrors = 0;
+            previousAwaiting = status.awaitingInput;
+
+            if (!sawNewResponse) {
+              const currentKey = `${status.response ? 1 : 0}|${status.response.length}|${status.response.substring(0, 100)}`;
+              if (status.response.length > 0 && currentKey !== beforeKey) {
+                sawNewResponse = true;
+              }
+            }
 
             if (status.response !== previousResponse) {
               lastActivityTime = Date.now();
@@ -333,7 +339,7 @@ const tool = defineTool({
           const t = setTimeout(fire, closeTimeout);
           t.unref?.();
         } else {
-          fire();
+          setImmediate(fire);
         }
       }
     }
