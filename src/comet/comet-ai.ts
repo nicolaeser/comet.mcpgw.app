@@ -339,6 +339,58 @@ export class CometAI {
     this.stableResponseCount = 0;
   }
 
+  async acceptInFlowConfirmation(opts: { allowDestructive?: boolean } = {}): Promise<{
+    clicked: boolean;
+    kind: "browser_control" | "destructive" | null;
+    text: string;
+  }> {
+    const allowDestructive = Boolean(opts.allowDestructive);
+    const result = await this.client.evaluate(`
+      (() => {
+        const SAFE = ${JSON.stringify([
+          'continue', 'proceed', 'next', 'ok', 'okay', 'got it', 'understood',
+          'allow', 'allow once', 'allow this time',
+          'fortfahren', 'weiter', 'verstanden', 'erlauben', 'einmal erlauben', 'zulassen',
+        ])};
+        const DESTR = ${JSON.stringify([
+          'send', 'submit', 'confirm', 'pay', 'purchase', 'buy', 'checkout',
+          'place order', 'sign in', 'log in', 'authorize', 'approve', 'delete', 'post', 'publish',
+          'senden', 'absenden', 'bestätigen', 'kaufen', 'bezahlen',
+          'anmelden', 'einloggen', 'genehmigen', 'löschen', 'veröffentlichen',
+        ])};
+        const allowDestructive = ${JSON.stringify(allowDestructive)};
+        const matchText = (t, list) => list.some((x) => t === x || t === x + '.' || t.startsWith(x + ' '));
+        const visible = [...document.querySelectorAll('button')]
+          .filter((b) => !b.disabled && b.offsetParent !== null);
+        for (const btn of visible) {
+          const t = (btn.innerText || '').trim().toLowerCase();
+          if (!t) continue;
+          if (matchText(t, SAFE)) {
+            const card = btn.closest('[role="dialog"], [class*="banner"], [class*="confirm"], [class*="prompt"], div');
+            const text = card ? (card.innerText || '').trim().substring(0, 400) : t;
+            try { btn.click(); } catch {}
+            return { clicked: true, kind: 'browser_control', text };
+          }
+        }
+        if (allowDestructive) {
+          for (const btn of visible) {
+            const t = (btn.innerText || '').trim().toLowerCase();
+            if (!t) continue;
+            if (matchText(t, DESTR)) {
+              const card = btn.closest('[role="dialog"], [class*="banner"], [class*="confirm"], [class*="prompt"], [class*="card"]');
+              if (!card) continue;
+              const text = (card.innerText || '').trim().substring(0, 400);
+              try { btn.click(); } catch {}
+              return { clicked: true, kind: 'destructive', text };
+            }
+          }
+        }
+        return { clicked: false, kind: null, text: '' };
+      })()
+    `);
+    return result.result.value as { clicked: boolean; kind: "browser_control" | "destructive" | null; text: string };
+  }
+
   async acceptBrowserControlBanner(): Promise<boolean> {
     const result = await this.client.evaluate(`
       (() => {
@@ -397,7 +449,7 @@ export class CometAI {
   }
 
   async getAgentStatus(): Promise<{
-    status: "idle" | "working" | "completed";
+    status: "idle" | "working" | "completed" | "awaiting_input";
     steps: string[];
     currentStep: string;
     response: string;
@@ -405,6 +457,9 @@ export class CometAI {
     agentBrowsingUrl: string;
     isStable: boolean;
     surface: "sidecar" | "thread" | "home";
+    awaitingInput: boolean;
+    confirmationPrompt: string;
+    confirmationKind: "browser_control" | "safe" | "destructive" | "unknown" | null;
   }> {
     let agentBrowsingUrl = "";
     try {
@@ -436,6 +491,64 @@ export class CometAI {
             break;
           }
         }
+
+        const SAFE_CONFIRM_TEXTS = [
+          'continue', 'proceed', 'next', 'ok', 'okay', 'got it', 'understood',
+          'allow', 'allow once', 'allow this time',
+          'fortfahren', 'weiter', 'verstanden', 'erlauben', 'einmal erlauben', 'zulassen',
+        ];
+        const DESTRUCTIVE_CONFIRM_TEXTS = [
+          'send', 'submit', 'confirm', 'pay', 'purchase', 'buy', 'checkout',
+          'place order', 'sign in', 'log in', 'authorize', 'approve', 'delete', 'post', 'publish',
+          'senden', 'absenden', 'bestätigen', 'best\\u00e4tigen', 'kaufen', 'bezahlen',
+          'anmelden', 'einloggen', 'genehmigen', 'löschen', 'l\\u00f6schen', 'veröffentlichen', 'ver\\u00f6ffentlichen',
+        ];
+        const matchText = (txt, list) => list.some((t) => txt === t || txt === t + '.' || txt.startsWith(t + ' '));
+
+        let confirmationKind = null;
+        let confirmationPrompt = '';
+
+        const allowVisible = [...document.querySelectorAll('button')]
+          .filter((b) => !b.disabled && b.offsetParent !== null);
+        for (const btn of allowVisible) {
+          const t = (btn.innerText || '').trim().toLowerCase();
+          if (!t) continue;
+          if (matchText(t, SAFE_CONFIRM_TEXTS)) {
+            const card = btn.closest('[role="dialog"], [class*="banner"], [class*="confirm"], [class*="prompt"], form, section, article, div');
+            confirmationKind = 'browser_control';
+            const ctxText = card ? (card.innerText || '').trim() : (btn.innerText || '').trim();
+            confirmationPrompt = ctxText.substring(0, 400);
+            break;
+          }
+        }
+        if (!confirmationKind) {
+          for (const btn of allowVisible) {
+            const t = (btn.innerText || '').trim().toLowerCase();
+            if (!t) continue;
+            if (matchText(t, DESTRUCTIVE_CONFIRM_TEXTS)) {
+              const card = btn.closest('[role="dialog"], [class*="banner"], [class*="confirm"], [class*="prompt"], [class*="card"]');
+              if (!card) continue;
+              const ctxText = (card.innerText || '').trim();
+              const looksLikeAgentCard = /agent|comet|assistant|allow|confirm|verify|review|proceed|send|order|pay/i.test(ctxText);
+              if (!looksLikeAgentCard) continue;
+              confirmationKind = 'destructive';
+              confirmationPrompt = ctxText.substring(0, 400);
+              break;
+            }
+          }
+        }
+        if (!confirmationKind) {
+          for (const useEl of document.querySelectorAll('svg use')) {
+            const href = useEl.getAttribute('xlink:href') || useEl.getAttribute('href');
+            if (href !== '#pplx-icon-click') continue;
+            const banner = useEl.closest('[class*="banner"], .relative, div');
+            if (!banner) continue;
+            confirmationKind = 'browser_control';
+            confirmationPrompt = (banner.innerText || '').trim().substring(0, 400);
+            break;
+          }
+        }
+        const awaitingInput = confirmationKind !== null;
 
         let inputReadyForFollowUp = false;
         const askInput = document.getElementById('ask-input');
@@ -496,7 +609,9 @@ export class CometAI {
 
         let status = 'idle';
 
-        if (hasActiveStopButton) {
+        if (awaitingInput && !hasLoadingSpinner && !hasThinkingIndicator) {
+          status = 'awaiting_input';
+        } else if (hasActiveStopButton) {
           status = 'working';
         } else if (hasLoadingSpinner || hasThinkingIndicator) {
           status = 'working';
@@ -612,23 +727,34 @@ export class CometAI {
           currentStep: steps.length > 0 ? steps[steps.length - 1] : '',
           response: response.substring(0, 8000),
           hasStopButton: hasActiveStopButton,
-          surface: onSidecar ? 'sidecar' : (onSearchPage ? 'thread' : 'home')
+          surface: onSidecar ? 'sidecar' : (onSearchPage ? 'thread' : 'home'),
+          awaitingInput,
+          confirmationPrompt,
+          confirmationKind
         };
       })()
     `);
 
     const statusResult = result.result.value as {
-      status: "idle" | "working" | "completed";
+      status: "idle" | "working" | "completed" | "awaiting_input";
       steps: string[];
       currentStep: string;
       response: string;
       hasStopButton: boolean;
       surface: "sidecar" | "thread" | "home";
+      awaitingInput: boolean;
+      confirmationPrompt: string;
+      confirmationKind: "browser_control" | "safe" | "destructive" | "unknown" | null;
     };
 
     const isStable = this.isResponseStable(statusResult.response);
 
-    if (isStable && statusResult.response.length > 50 && !statusResult.hasStopButton) {
+    if (
+      isStable &&
+      statusResult.response.length > 50 &&
+      !statusResult.hasStopButton &&
+      !statusResult.awaitingInput
+    ) {
       statusResult.status = "completed";
     }
 

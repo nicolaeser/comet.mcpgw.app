@@ -6,6 +6,7 @@ import { errorResult, textResult } from "../_shared/tool-result.js";
 const POLL_INTERVAL_MS = 1_500;
 const IDLE_TIMEOUT_MS = 6_000;
 const MAX_CONSECUTIVE_ERRORS = 5;
+const AWAITING_INPUT_GRACE_MS = 8_000;
 
 function normalizePrompt(raw: string): string {
   return raw
@@ -149,6 +150,8 @@ const tool = defineTool({
         let previousResponse = "";
         let consecutiveErrors = 0;
         let bannerAccepted = false;
+        let awaitingInputSince: number | null = null;
+        let lastConfirmationPrompt = "";
 
         while (Date.now() - start < timeout) {
           if (ctx.abortSignal.aborted) {
@@ -178,6 +181,16 @@ const tool = defineTool({
               }
             }
 
+            try {
+              const auto = await ai.acceptInFlowConfirmation({ allowDestructive: false });
+              if (auto.clicked) {
+                lastActivityTime = Date.now();
+                awaitingInputSince = null;
+              }
+            } catch {
+
+            }
+
             const current = await client.withAutoReconnect(async () => ai.getAnswerSnapshot());
 
             if (
@@ -203,10 +216,23 @@ const tool = defineTool({
               }
             }
 
+            if (status.awaitingInput) {
+              if (awaitingInputSince === null) awaitingInputSince = Date.now();
+              if (status.confirmationPrompt && status.confirmationPrompt !== lastConfirmationPrompt) {
+                lastConfirmationPrompt = status.confirmationPrompt;
+                lastActivityTime = Date.now();
+              }
+            } else {
+              awaitingInputSince = null;
+            }
+
+            const progressMessage = status.awaitingInput
+              ? `awaiting confirmation${status.confirmationKind ? ` (${status.confirmationKind})` : ""}`
+              : status.currentStep || status.status;
             await ctx.sendProgress(
               Math.min(Date.now() - start, timeout),
               timeout,
-              status.currentStep || status.status,
+              progressMessage,
             );
 
             if (status.status === "completed" && sawNewResponse && status.response) {
@@ -216,16 +242,32 @@ const tool = defineTool({
               status.isStable &&
               sawNewResponse &&
               status.response &&
-              !status.hasStopButton
+              !status.hasStopButton &&
+              !status.awaitingInput
             ) {
               return textResult(status.response);
+            }
+            if (
+              awaitingInputSince !== null &&
+              Date.now() - awaitingInputSince > AWAITING_INPUT_GRACE_MS
+            ) {
+              const lines: string[] = [
+                `Task ${task.id}: paused — Comet is waiting for confirmation in the browser.`,
+                status.confirmationKind ? `Kind: ${status.confirmationKind}` : null,
+                status.confirmationPrompt ? `Prompt: ${status.confirmationPrompt}` : null,
+                "",
+                `Approve manually in the Comet sidecar, or call comet_accept_banner task_id=${task.id} ` +
+                  `(safe confirmations only). Then call comet_poll task_id=${task.id} to resume.`,
+              ].filter(Boolean) as string[];
+              return textResult(lines.join("\n"));
             }
             const idleMs = Date.now() - lastActivityTime;
             if (
               idleMs > IDLE_TIMEOUT_MS &&
               sawNewResponse &&
               status.response &&
-              !status.hasStopButton
+              !status.hasStopButton &&
+              !status.awaitingInput
             ) {
               return textResult(status.response);
             }
@@ -254,7 +296,7 @@ const tool = defineTool({
         }
 
         const finalStatus = await ai.getAgentStatus();
-        if (finalStatus.response) {
+        if (finalStatus.response && !finalStatus.awaitingInput) {
           return textResult(finalStatus.response);
         }
 
@@ -262,6 +304,9 @@ const tool = defineTool({
           `Task ${task.id}: still in progress (timeout=${timeout}ms reached).`,
           `Status: ${finalStatus.status.toUpperCase()}`,
         ];
+        if (finalStatus.awaitingInput && finalStatus.confirmationPrompt) {
+          lines.push(`Awaiting: ${finalStatus.confirmationPrompt}`);
+        }
         if (finalStatus.currentStep) lines.push(`Current: ${finalStatus.currentStep}`);
         if (finalStatus.agentBrowsingUrl) lines.push(`Browsing: ${finalStatus.agentBrowsingUrl}`);
         if (collectedSteps.length > 0) {

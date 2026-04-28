@@ -5,12 +5,14 @@ import { errorResult, textResult } from "../_shared/tool-result.js";
 
 const tool = defineTool({
   name: "comet_accept_banner",
-  title: "Accept Comet's browser-control banner",
+  title: "Accept a Comet confirmation",
   description:
-    'Manually accept Perplexity\'s "Allow assistant to control your browser?" banner ' +
-    "for a task. comet_ask already auto-accepts in a loop, so call this only when " +
-    "you see the agent stuck waiting for permission (e.g. the banner appeared mid-task " +
-    "and the auto-accept missed it). Returns whether a banner was actually clicked.",
+    "Manually approve a Comet confirmation prompt — both the initial \"Allow assistant " +
+    "to control your browser?\" banner and in-flow safe-confirm cards (Continue / Proceed / Allow / OK). " +
+    "comet_ask auto-accepts safe confirmations in its poll loop, so call this only when the agent " +
+    "is stuck and the auto-accept missed it. By default destructive actions (Send / Submit / Pay / " +
+    "Confirm / Sign in / Delete) are NEVER auto-clicked — pass allow_destructive=true to override " +
+    "(use with extreme caution).",
   rateLimit: { tool: { max: 60 } },
   annotations: {
     readOnlyHint: false,
@@ -22,16 +24,29 @@ const tool = defineTool({
       .string()
       .optional()
       .describe("Task to operate on. Required when more than one task is active."),
+    allow_destructive: z
+      .boolean()
+      .default(false)
+      .describe(
+        "If true, also click destructive confirmation buttons (Send / Submit / Pay / Confirm / " +
+          "Sign in / Delete). Disabled by default to avoid irreversible actions without explicit consent.",
+      ),
   },
-  async execute({ task_id }) {
+  async execute({ task_id, allow_destructive }) {
     try {
       return await taskRegistry.withTask(task_id, async (task) => {
-        const accepted = await task.ai.acceptBrowserControlBanner();
-        return textResult(
-          accepted
-            ? `Banner accepted on task ${task.id}.`
-            : `No browser-control banner visible on task ${task.id}.`,
-        );
+        const bannerClicked = await task.ai.acceptBrowserControlBanner();
+        const inFlow = await task.ai.acceptInFlowConfirmation({ allowDestructive: allow_destructive });
+        if (bannerClicked || inFlow.clicked) {
+          const parts: string[] = [];
+          if (bannerClicked) parts.push("browser-control banner");
+          if (inFlow.clicked) parts.push(`in-flow ${inFlow.kind}`);
+          return textResult(
+            `Accepted on task ${task.id}: ${parts.join(", ")}` +
+              (inFlow.text ? `\nPrompt: ${inFlow.text}` : ""),
+          );
+        }
+        return textResult(`No confirmation visible on task ${task.id}.`);
       });
     } catch (err) {
       return errorResult(

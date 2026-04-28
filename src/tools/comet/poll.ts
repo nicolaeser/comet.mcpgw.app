@@ -24,7 +24,7 @@ const tool = defineTool({
       return await taskRegistry.withTask(task_id, async (task) => {
         const status = await task.ai.getAgentStatus();
 
-        if (status.status === "completed" && status.response) {
+        if (status.status === "completed" && status.response && !status.awaitingInput) {
           return textResult(status.response);
         }
 
@@ -32,6 +32,10 @@ const tool = defineTool({
           `Task: ${task.id}`,
           `Status: ${status.status.toUpperCase()}`,
         ];
+        if (status.awaitingInput) {
+          if (status.confirmationKind) lines.push(`Awaiting: ${status.confirmationKind}`);
+          if (status.confirmationPrompt) lines.push(`Prompt: ${status.confirmationPrompt}`);
+        }
         if (status.agentBrowsingUrl) lines.push(`Browsing: ${status.agentBrowsingUrl}`);
         if (status.currentStep) lines.push(`Current: ${status.currentStep}`);
 
@@ -41,7 +45,13 @@ const tool = defineTool({
           for (const step of status.steps) lines.push(`  • ${step}`);
         }
 
-        if (status.status === "working") {
+        if (status.awaitingInput) {
+          lines.push("");
+          lines.push(
+            `Comet is paused for confirmation. Approve manually in the browser or call ` +
+              `comet_accept_banner task_id=${task.id} (safe confirmations only).`,
+          );
+        } else if (status.status === "working") {
           lines.push("");
           lines.push(`Use comet_stop task_id=${task.id} to interrupt or comet_screenshot task_id=${task.id} to inspect.`);
         }
