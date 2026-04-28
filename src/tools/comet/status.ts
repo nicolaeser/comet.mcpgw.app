@@ -47,6 +47,10 @@ const tool = defineTool({
         `  • ${t.id}${t.label ? ` (${t.label})` : ""} — tab=${t.client.targetId ?? "?"} kind=${t.attachedKind} url=${t.client.currentState.currentUrl ?? "?"} age=${ageSec}s`,
       );
     }
+    const pendingCount = taskRegistry.pendingCount();
+    if (pendingCount > 0) {
+      lines.push(`Pending task creations (tabs claimed but not yet registered): ${pendingCount}`);
+    }
 
     try {
       const all = await listAllTargets();

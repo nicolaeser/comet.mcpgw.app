@@ -78,7 +78,7 @@ npm run dev
 | `comet_status` | Bridge health + active task list. Call first when troubleshooting. |
 | `comet_connect` | Create a new isolated task; returns `task_id`. |
 | `comet_tasks` | List active tasks with id, label, tab, URL, age, idle, keepAlive. |
-| `comet_task_close` | Tear down a task (or `all=true`). |
+| `comet_task_close` | Tear down a task (or `all=true`). Closes the owned tab plus any auxiliary tabs the agent opened during the task. |
 | `comet_rename_task` | Change a task's label. |
 | `comet_inspect` | URL/title/age/idle for one task. |
 
@@ -137,6 +137,42 @@ For asynchronous clients such as n8n, call `comet_ask` with `wait=false`, then
 poll with `comet_poll`. The task inherits the same auto-close preference and
 will close when `comet_poll` observes completion unless `closeAfter=false` was
 set on the ask or poll call.
+
+### Auxiliary tab cleanup
+
+When Comet's agent browses third-party sites during a task (e.g. opens
+`kayak.com`, `google.com/travel/flights`, etc.), those tabs are not children of
+the Perplexity sidecar in the CDP `openerId` sense — they're spawned by the
+browser-agent overlay. To make `comet_task_close` clean them up reliably, the
+registry takes a snapshot of all existing page targets when a task is created
+(`preexistingTargetIds`). On close, every page target that:
+
+- did not exist when the task was created, AND
+- is not claimed by another active task (registered or pending), AND
+- is not `chrome://` or `devtools://`,
+
+is closed alongside the owned tab. Pre-existing tabs and tabs owned by other
+tasks are never touched.
+
+### Parallel safety
+
+The registry is race-safe across concurrent `create()` and `close()` calls:
+
+- **Pending claims:** A tab is added to `pendingTabIds` the moment `cdpNewTab`
+  returns, before the task is fully registered. Other tasks running `close()`
+  in the same window see this set and skip the tab. `findPerplexityTarget` also
+  consults it, so a concurrent `attach="sidecar"` cannot adopt another task's
+  pending sidecar.
+- **Per-task snapshots:** Each task's `preexistingTargetIds` is taken at its
+  own `create()` start, so tabs created by Task B during Task A's lifetime are
+  never seen as auxiliaries of A.
+- **Live registry lookup:** `otherTaskTabIds` is computed from the live
+  registry at `close()` time, so closes that race in `closeAll()` see each
+  other's owned/child tabs and don't touch them.
+- **Orphan cleanup on failure:** If `create()` opens a tab via `cdpNewTab` but
+  throws before the task is registered, the orphan tab is closed in `finally`.
+- **Zombie detection:** The idle sweep also lists the browser's live page
+  targets and removes registered tasks whose owned tab no longer exists.
 
 ---
 

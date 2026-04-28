@@ -182,6 +182,8 @@ export class TaskRegistry {
     })();
 
     let pendingClaim: string | undefined;
+    let openedByUs: string | undefined;
+    let registered = false;
     const claimTab = (id: string) => {
       pendingClaim = id;
       this.pendingTabIds.add(id);
@@ -237,6 +239,7 @@ export class TaskRegistry {
           await report(0, "no existing Perplexity surface — opening fresh tab");
           const tab = await cdpNewTab("https://www.perplexity.ai/");
           targetId = tab.id;
+          openedByUs = targetId;
           claimTab(targetId);
           await new Promise((r) => setTimeout(r, 800));
         }
@@ -250,6 +253,7 @@ export class TaskRegistry {
       await report(0, "opening fresh Perplexity tab");
       const tab = await cdpNewTab("https://www.perplexity.ai/");
       targetId = tab.id;
+      openedByUs = targetId;
       claimTab(targetId);
       await new Promise((r) => setTimeout(r, 800));
     }
@@ -323,6 +327,7 @@ export class TaskRegistry {
       preexistingTargetIds,
     };
     this.tasks.set(task.id, task);
+    registered = true;
     await report(total, "task ready");
     logger.info(
       "Comet task created",
@@ -338,6 +343,23 @@ export class TaskRegistry {
     return task;
     } finally {
       if (pendingClaim) this.pendingTabIds.delete(pendingClaim);
+      if (!registered && openedByUs) {
+        const orphanId = openedByUs;
+        try {
+          const ok = await cdpCloseTab(orphanId);
+          logger.warn(
+            "Comet task creation failed — orphan tab cleanup",
+            { targetId: orphanId, closed: ok },
+            { privacySafe: true },
+          );
+        } catch (err) {
+          logger.warn(
+            "Comet task creation failed — orphan tab cleanup error",
+            { targetId: orphanId, error: err instanceof Error ? err.message : String(err) },
+            { privacySafe: true },
+          );
+        }
+      }
     }
   }
 
@@ -372,7 +394,29 @@ export class TaskRegistry {
 
   private async sweepIdle(): Promise<void> {
     const now = Date.now();
+
+    let liveTargetIds: Set<string> | null = null;
+    try {
+      const targets = await cdpListTargets();
+      liveTargetIds = new Set(targets.filter((t) => t.type === "page").map((t) => t.id));
+    } catch {
+
+    }
+
     for (const task of this.tasks.values()) {
+      if (liveTargetIds && task.client.targetId && !liveTargetIds.has(task.client.targetId)) {
+        logger.info(
+          "Comet task auto-closed (zombie — owned tab no longer exists)",
+          { taskId: task.id, targetId: task.client.targetId },
+          { privacySafe: true },
+        );
+        try {
+          await this.close(task.id);
+        } catch {
+
+        }
+        continue;
+      }
       if (task.keepAlive) continue;
       if (now - task.lastUsedAt < this.idleTtlMs) continue;
       logger.info(
@@ -396,6 +440,10 @@ export class TaskRegistry {
 
   list(): CometTask[] {
     return [...this.tasks.values()];
+  }
+
+  pendingCount(): number {
+    return this.pendingTabIds.size;
   }
 
   resolve(id?: string): CometTask {
@@ -467,7 +515,7 @@ export class TaskRegistry {
       }
     }
 
-    const closedAuxiliary: string[] = [];
+    const closedAuxiliary: { id: string; url: string }[] = [];
     try {
       const otherTaskTabIds = new Set<string>();
       for (const other of this.tasks.values()) {
@@ -491,7 +539,7 @@ export class TaskRegistry {
         attemptedIds.add(t.id);
         try {
           const ok = await cdpCloseTab(t.id);
-          if (ok) closedAuxiliary.push(t.id);
+          if (ok) closedAuxiliary.push({ id: t.id, url: t.url });
         } catch {
 
         }
@@ -527,6 +575,7 @@ export class TaskRegistry {
         closedOwnedTab: closedOwned,
         closedChildTabs: closedChildren.length,
         closedAuxiliaryTabs: closedAuxiliary.length,
+        closedAuxiliaryUrls: closedAuxiliary.map((a) => a.url),
         attachedKind: task.attachedKind,
       },
       { privacySafe: true },
