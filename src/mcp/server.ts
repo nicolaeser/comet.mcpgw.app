@@ -878,8 +878,32 @@ export class McpServerSession {
       elicit: (params) => this.elicit(params),
     };
 
-    const result = await tool.execute(args, context);
-    return normalizeToolResult(result, this.protocolVersion);
+    const startedAt = Date.now();
+    try {
+      const result = await tool.execute(args, context);
+      const normalized = normalizeToolResult(result, this.protocolVersion);
+      logger.info(
+        "MCP tool completed",
+        {
+          tool: tool.name,
+          durationMs: Date.now() - startedAt,
+          isError: Boolean(normalized.isError),
+        },
+        { privacySafe: true },
+      );
+      return normalized;
+    } catch (err) {
+      logger.warn(
+        "MCP tool threw",
+        {
+          tool: tool.name,
+          durationMs: Date.now() - startedAt,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        { privacySafe: true },
+      );
+      throw err;
+    }
   }
 
   private listRoots(): Promise<unknown> {
