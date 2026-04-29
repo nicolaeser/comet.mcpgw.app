@@ -10,6 +10,7 @@ import type {
 
 const HTTP_TIMEOUT_MS = 5_000;
 const HEALTH_CHECK_TIMEOUT_MS = 3_000;
+const EVALUATE_TIMEOUT_MS = Number(process.env.COMET_EVALUATE_TIMEOUT_MS ?? 8_000);
 
 export interface CDPConfig {
   cdpHost: string;
@@ -93,8 +94,57 @@ export interface NetworkEntry {
   failureReason?: string;
 }
 
+export interface EventSourceEntry {
+  ts: number;
+  requestId: string;
+  url?: string;
+  eventName: string;
+  eventId?: string;
+  data: string;
+}
+
+export interface WebSocketFrameEntry {
+  ts: number;
+  requestId: string;
+  url?: string;
+  direction: "sent" | "received";
+  opcode?: number;
+  mask?: boolean;
+  payloadData: string;
+}
+
+export interface StreamRequestEntry {
+  ts: number;
+  requestId: string;
+  method: string;
+  url: string;
+  resourceType: string;
+  status?: number;
+  statusText?: string;
+  mimeType?: string;
+  postData?: string;
+  chunkCount: number;
+  dataLength: number;
+  encodedDataLength: number;
+  text: string;
+  textLength: number;
+  bufferedDataLength: number;
+  lastChunkAt?: number;
+  streamContentEnabled?: boolean;
+  streamContentEnablePending?: boolean;
+  streamContentError?: string;
+  finished?: boolean;
+  failed?: boolean;
+  failureReason?: string;
+  durationMs?: number;
+}
+
 const MAX_CONSOLE = Number(process.env.COMET_MAX_CONSOLE ?? 500);
 const MAX_NETWORK = Number(process.env.COMET_MAX_NETWORK ?? 500);
+const MAX_EVENT_SOURCE = Number(process.env.COMET_MAX_EVENT_SOURCE ?? 1000);
+const MAX_WEBSOCKET = Number(process.env.COMET_MAX_WEBSOCKET ?? 1000);
+const MAX_STREAM_REQUESTS = Number(process.env.COMET_MAX_STREAM_REQUESTS ?? 100);
+const MAX_STREAM_TEXT = Number(process.env.COMET_MAX_STREAM_TEXT ?? 250_000);
 
 export class CometCDPClient {
   private config: CDPConfig;
@@ -102,6 +152,7 @@ export class CometCDPClient {
   private state: CometState = { connected: false };
 
   private ownedTargetId: string | undefined;
+  private currentTargetIsExternalReplacement = false;
 
   private childTargetIds = new Set<string>();
   private reconnectAttempts = 0;
@@ -114,6 +165,11 @@ export class CometCDPClient {
   private consoleBuffer: ConsoleEntry[] = [];
   private networkBuffer: NetworkEntry[] = [];
   private networkInFlight = new Map<string, NetworkEntry>();
+  private networkUrlByRequestId = new Map<string, string>();
+  private eventSourceBuffer: EventSourceEntry[] = [];
+  private webSocketBuffer: WebSocketFrameEntry[] = [];
+  private streamRequestBuffer: StreamRequestEntry[] = [];
+  private streamRequestsById = new Map<string, StreamRequestEntry>();
 
   private mainFrameLoadCbs = new Set<() => void>();
 
@@ -142,6 +198,14 @@ export class CometCDPClient {
 
   get targetId(): string | undefined {
     return this.ownedTargetId;
+  }
+
+  get shouldCloseTargetOnTaskClose(): boolean {
+    return !this.currentTargetIsExternalReplacement;
+  }
+
+  get childTargets(): string[] {
+    return [...this.childTargetIds];
   }
 
   async isConnectionHealthy(): Promise<boolean> {
@@ -262,7 +326,10 @@ export class CometCDPClient {
     return null;
   }
 
-  async connect(targetId: string): Promise<string> {
+  async connect(
+    targetId: string,
+    opts: { externalReplacement?: boolean } = {},
+  ): Promise<string> {
     if (this.client) await this.disconnect();
 
     const options: CDP.Options = {
@@ -281,13 +348,23 @@ export class CometCDPClient {
     ]);
 
     try {
-      this.client.Page.loadEventFired(() => {
+      const fireLoadCbs = () => {
         for (const cb of this.mainFrameLoadCbs) {
           try {
             cb();
           } catch {}
         }
-      });
+      };
+      this.client.Page.loadEventFired(fireLoadCbs);
+      try {
+        const page = this.client.Page as unknown as {
+          frameNavigated: (cb: (params: { frame: { id: string; parentId?: string; url: string } }) => void) => void;
+        };
+        page.frameNavigated((params) => {
+          if (params.frame.parentId) return;
+          fireLoadCbs();
+        });
+      } catch {}
     } catch {}
 
     try {
@@ -341,7 +418,7 @@ export class CometCDPClient {
       const network = this.client.Network as unknown as {
         requestWillBeSent: (cb: (p: {
           requestId: string;
-          request: { url: string; method: string };
+          request: { url: string; method: string; postData?: string };
           type?: string;
           timestamp: number;
         }) => void) => void;
@@ -349,6 +426,13 @@ export class CometCDPClient {
           requestId: string;
           response: { status: number; statusText: string; mimeType: string; encodedDataLength?: number };
           timestamp: number;
+        }) => void) => void;
+        dataReceived: (cb: (p: {
+          requestId: string;
+          timestamp: number;
+          dataLength: number;
+          encodedDataLength: number;
+          data?: string;
         }) => void) => void;
         loadingFinished: (cb: (p: { requestId: string; encodedDataLength: number; timestamp: number }) => void) => void;
         loadingFailed: (cb: (p: { requestId: string; errorText: string; timestamp: number }) => void) => void;
@@ -362,32 +446,146 @@ export class CometCDPClient {
           resourceType: p.type ?? "Other",
         };
         this.networkInFlight.set(p.requestId, entry);
+        this.networkUrlByRequestId.set(p.requestId, p.request.url);
         this.pushNetwork(entry);
+        if (this.isStreamRequestUrl(p.request.url)) {
+          this.getOrCreateStreamRequest({
+            requestId: p.requestId,
+            method: p.request.method,
+            url: p.request.url,
+            resourceType: p.type ?? "Other",
+            postData: p.request.postData,
+          });
+        }
       });
       network.responseReceived((p) => {
         const entry = this.networkInFlight.get(p.requestId);
-        if (!entry) return;
-        entry.status = p.response.status;
-        entry.statusText = p.response.statusText;
-        entry.mimeType = p.response.mimeType;
-        if (typeof p.response.encodedDataLength === "number") {
-          entry.encodedDataLength = p.response.encodedDataLength;
+        if (entry) {
+          entry.status = p.response.status;
+          entry.statusText = p.response.statusText;
+          entry.mimeType = p.response.mimeType;
+          if (typeof p.response.encodedDataLength === "number") {
+            entry.encodedDataLength = p.response.encodedDataLength;
+          }
+        }
+        const url = this.networkUrlByRequestId.get(p.requestId) ?? entry?.url ?? "";
+        if (this.isStreamRequestUrl(url) || this.isEventStreamMime(p.response.mimeType)) {
+          const stream = this.getOrCreateStreamRequest({
+            requestId: p.requestId,
+            method: entry?.method ?? "GET",
+            url,
+            resourceType: entry?.resourceType ?? "Other",
+          });
+          stream.status = p.response.status;
+          stream.statusText = p.response.statusText;
+          stream.mimeType = p.response.mimeType;
+          if (typeof p.response.encodedDataLength === "number") {
+            stream.encodedDataLength = p.response.encodedDataLength;
+          }
+          void this.enableResourceContentStreaming(p.requestId);
+        }
+      });
+      network.dataReceived((p) => {
+        const stream = this.streamRequestsById.get(p.requestId);
+        if (!stream) return;
+        stream.chunkCount += 1;
+        stream.dataLength += p.dataLength;
+        stream.encodedDataLength += p.encodedDataLength;
+        stream.lastChunkAt = Date.now();
+        if (p.data) {
+          this.appendStreamText(p.requestId, p.data, false);
         }
       });
       network.loadingFinished((p) => {
         const entry = this.networkInFlight.get(p.requestId);
-        if (!entry) return;
-        entry.encodedDataLength = p.encodedDataLength;
-        entry.durationMs = Date.now() - entry.ts;
-        this.networkInFlight.delete(p.requestId);
+        if (entry) {
+          entry.encodedDataLength = p.encodedDataLength;
+          entry.durationMs = Date.now() - entry.ts;
+          this.networkInFlight.delete(p.requestId);
+          this.networkUrlByRequestId.delete(p.requestId);
+        }
+        const stream = this.streamRequestsById.get(p.requestId);
+        if (stream) {
+          stream.encodedDataLength = p.encodedDataLength;
+          stream.finished = true;
+          stream.durationMs = Date.now() - stream.ts;
+        }
       });
       network.loadingFailed((p) => {
         const entry = this.networkInFlight.get(p.requestId);
-        if (!entry) return;
-        entry.failed = true;
-        entry.failureReason = p.errorText;
-        entry.durationMs = Date.now() - entry.ts;
-        this.networkInFlight.delete(p.requestId);
+        if (entry) {
+          entry.failed = true;
+          entry.failureReason = p.errorText;
+          entry.durationMs = Date.now() - entry.ts;
+          this.networkInFlight.delete(p.requestId);
+          this.networkUrlByRequestId.delete(p.requestId);
+        }
+        const stream = this.streamRequestsById.get(p.requestId);
+        if (stream) {
+          stream.failed = true;
+          stream.failureReason = p.errorText;
+          stream.durationMs = Date.now() - stream.ts;
+        }
+      });
+    } catch {
+
+    }
+
+    try {
+      const network = this.client.Network as unknown as {
+        eventSourceMessageReceived: (cb: (p: {
+          requestId: string;
+          timestamp: number;
+          eventName: string;
+          eventId?: string;
+          data: string;
+        }) => void) => void;
+        webSocketCreated: (cb: (p: { requestId: string; url: string }) => void) => void;
+        webSocketFrameReceived: (cb: (p: {
+          requestId: string;
+          timestamp: number;
+          response: { opcode?: number; mask?: boolean; payloadData: string };
+        }) => void) => void;
+        webSocketFrameSent: (cb: (p: {
+          requestId: string;
+          timestamp: number;
+          response: { opcode?: number; mask?: boolean; payloadData: string };
+        }) => void) => void;
+      };
+      network.eventSourceMessageReceived((p) => {
+        this.pushEventSource({
+          ts: Date.now(),
+          requestId: p.requestId,
+          url: this.networkUrlByRequestId.get(p.requestId),
+          eventName: p.eventName,
+          eventId: p.eventId,
+          data: p.data,
+        });
+      });
+      network.webSocketCreated((p) => {
+        this.networkUrlByRequestId.set(p.requestId, p.url);
+      });
+      network.webSocketFrameReceived((p) => {
+        this.pushWebSocketFrame({
+          ts: Date.now(),
+          requestId: p.requestId,
+          url: this.networkUrlByRequestId.get(p.requestId),
+          direction: "received",
+          opcode: p.response.opcode,
+          mask: p.response.mask,
+          payloadData: p.response.payloadData,
+        });
+      });
+      network.webSocketFrameSent((p) => {
+        this.pushWebSocketFrame({
+          ts: Date.now(),
+          requestId: p.requestId,
+          url: this.networkUrlByRequestId.get(p.requestId),
+          direction: "sent",
+          opcode: p.response.opcode,
+          mask: p.response.mask,
+          payloadData: p.response.payloadData,
+        });
       });
     } catch {
 
@@ -413,6 +611,7 @@ export class CometCDPClient {
     this.state.connected = true;
     this.state.activeTabId = targetId;
     this.ownedTargetId = targetId;
+    this.currentTargetIsExternalReplacement = Boolean(opts.externalReplacement);
     this.reconnectAttempts = 0;
 
     const { result } = await this.client.Runtime.evaluate({
@@ -433,6 +632,9 @@ export class CometCDPClient {
     this.client = null;
     this.state.connected = false;
     this.state.activeTabId = undefined;
+    this.networkInFlight.clear();
+    this.networkUrlByRequestId.clear();
+    this.streamRequestsById.clear();
   }
 
   async reconnect(): Promise<string> {
@@ -452,11 +654,39 @@ export class CometCDPClient {
 
     const targets = await this.listTargets();
     if (!targets.some((t) => t.id === this.ownedTargetId)) {
+      const replacement = this.findRecoverablePerplexityTarget(targets);
+      if (replacement) {
+        return this.connect(replacement.id, { externalReplacement: true });
+      }
       throw new Error(
         `Owned tab ${this.ownedTargetId} no longer exists. The task tab was closed externally.`,
       );
     }
     return this.connect(this.ownedTargetId);
+  }
+
+  private findRecoverablePerplexityTarget(targets: CDPTarget[]): CDPTarget | null {
+    const candidates = targets.filter(
+      (t) => t.type === "page" && this.isRecoverablePerplexityUrl(t.url),
+    );
+    if (candidates.length === 0) return null;
+
+    const sidecarSearch = candidates.filter((t) => /\/sidecar\/search\//.test(t.url));
+    if (sidecarSearch.length === 1) return sidecarSearch[0];
+
+    const sidecar = candidates.filter((t) => /\/sidecar(?:[/?#]|$)/.test(t.url));
+    if (sidecar.length === 1) return sidecar[0];
+
+    const thread = candidates.filter((t) => /\/(?:search|thread)\//.test(t.url));
+    if (thread.length === 1) return thread[0];
+
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  private isRecoverablePerplexityUrl(url: string): boolean {
+    if (!url.startsWith("https://www.perplexity.ai/")) return false;
+    if (url.includes("/rest/")) return false;
+    return /\/sidecar(?:[/?#]|$)|\/(?:search|thread)\//.test(url);
   }
 
   private async isHealthy(): Promise<boolean> {
@@ -526,6 +756,27 @@ export class CometCDPClient {
         this.isReconnecting = false;
       }
     }
+  }
+
+  async addScriptToEvaluateOnNewDocument(source: string): Promise<string | null> {
+    this.ensureClient();
+    try {
+      const r = (await (this.client!.Page as unknown as {
+        addScriptToEvaluateOnNewDocument: (p: { source: string }) => Promise<{ identifier: string }>;
+      }).addScriptToEvaluateOnNewDocument({ source })) as { identifier: string };
+      return r.identifier ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async removeScriptToEvaluateOnNewDocument(identifier: string): Promise<void> {
+    this.ensureClient();
+    try {
+      await (this.client!.Page as unknown as {
+        removeScriptToEvaluateOnNewDocument: (p: { identifier: string }) => Promise<void>;
+      }).removeScriptToEvaluateOnNewDocument({ identifier });
+    } catch {}
   }
 
   async navigate(url: string, waitForLoad = true): Promise<NavigateResult> {
@@ -661,6 +912,51 @@ export class CometCDPClient {
     }).clearDeviceMetricsOverride();
   }
 
+  async fitWindowToDisplay(opts: { mode?: "maximize" | "fullscreen" } = {}): Promise<{
+    ok: boolean;
+    width?: number;
+    height?: number;
+    state?: string;
+    error?: string;
+  }> {
+    if (!this.client || !this.ownedTargetId) {
+      return { ok: false, error: "not connected" };
+    }
+    const mode = opts.mode ?? "maximize";
+    try {
+      const browser = this.client.Browser as unknown as {
+        getWindowForTarget: (p: { targetId: string }) => Promise<{
+          windowId: number;
+          bounds: { left?: number; top?: number; width?: number; height?: number; windowState?: string };
+        }>;
+        setWindowBounds: (p: { windowId: number; bounds: Record<string, unknown> }) => Promise<void>;
+      };
+      const { windowId } = await browser.getWindowForTarget({ targetId: this.ownedTargetId });
+      const screen = await this.evaluate(`({
+        w: window.screen.availWidth || window.screen.width,
+        h: window.screen.availHeight || window.screen.height
+      })`);
+      const v = (screen.result.value as { w: number; h: number }) || { w: 0, h: 0 };
+      if (mode === "fullscreen") {
+        await browser.setWindowBounds({ windowId, bounds: { windowState: "fullscreen" } });
+        return { ok: true, state: "fullscreen", width: v.w, height: v.h };
+      }
+      await browser.setWindowBounds({ windowId, bounds: { windowState: "normal" } });
+      await browser.setWindowBounds({
+        windowId,
+        bounds: { left: 0, top: 0, width: v.w || 1440, height: v.h || 900, windowState: "normal" },
+      });
+      try {
+        await browser.setWindowBounds({ windowId, bounds: { windowState: "maximized" } });
+      } catch {
+
+      }
+      return { ok: true, state: "maximized", width: v.w, height: v.h };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   async clickSelector(selector: string): Promise<{ success: boolean; error?: string }> {
     this.ensureClient();
     const r = await this.evaluate(`
@@ -746,6 +1042,68 @@ export class CometCDPClient {
   clearNetworkBuffer(): void {
     this.networkBuffer = [];
     this.networkInFlight.clear();
+    this.networkUrlByRequestId.clear();
+  }
+
+  getStreamRequestEntries(opts: {
+    limit?: number;
+    urlSubstring?: string;
+    onlyActive?: boolean;
+    substring?: string;
+  } = {}): StreamRequestEntry[] {
+    let entries = this.streamRequestBuffer;
+    if (opts.urlSubstring) entries = entries.filter((e) => e.url.includes(opts.urlSubstring!));
+    if (opts.onlyActive) entries = entries.filter((e) => !e.finished && !e.failed);
+    if (opts.substring) entries = entries.filter((e) => e.text.includes(opts.substring!));
+    if (opts.limit) entries = entries.slice(-opts.limit);
+    return entries.map((entry) => ({ ...entry }));
+  }
+
+  clearStreamRequestBuffer(): void {
+    this.streamRequestBuffer = [];
+    this.streamRequestsById.clear();
+  }
+
+  getEventSourceEntries(opts: {
+    limit?: number;
+    urlSubstring?: string;
+    eventName?: string;
+    substring?: string;
+  } = {}): EventSourceEntry[] {
+    let entries = this.eventSourceBuffer;
+    if (opts.urlSubstring) entries = entries.filter((e) => (e.url ?? "").includes(opts.urlSubstring!));
+    if (opts.eventName) entries = entries.filter((e) => e.eventName === opts.eventName);
+    if (opts.substring) entries = entries.filter((e) => e.data.includes(opts.substring!));
+    if (opts.limit) entries = entries.slice(-opts.limit);
+    return entries;
+  }
+
+  clearEventSourceBuffer(): void {
+    this.eventSourceBuffer = [];
+  }
+
+  getWebSocketFrames(opts: {
+    limit?: number;
+    urlSubstring?: string;
+    direction?: "sent" | "received";
+    substring?: string;
+  } = {}): WebSocketFrameEntry[] {
+    let frames = this.webSocketBuffer;
+    if (opts.urlSubstring) frames = frames.filter((e) => (e.url ?? "").includes(opts.urlSubstring!));
+    if (opts.direction) frames = frames.filter((e) => e.direction === opts.direction);
+    if (opts.substring) frames = frames.filter((e) => e.payloadData.includes(opts.substring!));
+    if (opts.limit) frames = frames.slice(-opts.limit);
+    return frames;
+  }
+
+  clearWebSocketBuffer(): void {
+    this.webSocketBuffer = [];
+  }
+
+  clearProtocolBuffers(): void {
+    this.clearEventSourceBuffer();
+    this.clearWebSocketBuffer();
+    this.clearStreamRequestBuffer();
   }
 
   private pushConsole(entry: ConsoleEntry): void {
@@ -762,13 +1120,142 @@ export class CometCDPClient {
     }
   }
 
+  private getOrCreateStreamRequest(params: {
+    requestId: string;
+    method: string;
+    url: string;
+    resourceType: string;
+    postData?: string;
+  }): StreamRequestEntry {
+    const existing = this.streamRequestsById.get(params.requestId);
+    if (existing) {
+      existing.method = params.method || existing.method;
+      existing.url = params.url || existing.url;
+      existing.resourceType = params.resourceType || existing.resourceType;
+      if (params.postData !== undefined) existing.postData = params.postData;
+      return existing;
+    }
+
+    const entry: StreamRequestEntry = {
+      ts: Date.now(),
+      requestId: params.requestId,
+      method: params.method,
+      url: params.url,
+      resourceType: params.resourceType,
+      postData: params.postData,
+      chunkCount: 0,
+      dataLength: 0,
+      encodedDataLength: 0,
+      text: "",
+      textLength: 0,
+      bufferedDataLength: 0,
+    };
+    this.streamRequestsById.set(params.requestId, entry);
+    this.streamRequestBuffer.push(entry);
+    if (this.streamRequestBuffer.length > MAX_STREAM_REQUESTS) {
+      const removed = this.streamRequestBuffer.splice(
+        0,
+        this.streamRequestBuffer.length - MAX_STREAM_REQUESTS,
+      );
+      for (const old of removed) {
+        if (this.streamRequestsById.get(old.requestId) === old) {
+          this.streamRequestsById.delete(old.requestId);
+        }
+      }
+    }
+    return entry;
+  }
+
+  private async enableResourceContentStreaming(requestId: string): Promise<void> {
+    if (!this.client) return;
+    const entry = this.streamRequestsById.get(requestId);
+    if (!entry || entry.streamContentEnabled || entry.streamContentEnablePending) return;
+
+    entry.streamContentEnablePending = true;
+    try {
+      const client = this.client as unknown as {
+        send?: (method: string, params?: Record<string, unknown>) => Promise<{ bufferedData?: string }>;
+        Network?: {
+          streamResourceContent?: (params: { requestId: string }) => Promise<{ bufferedData?: string }>;
+        };
+      };
+      const response = client.Network?.streamResourceContent
+        ? await client.Network.streamResourceContent({ requestId })
+        : await client.send?.("Network.streamResourceContent", { requestId });
+
+      entry.streamContentEnabled = true;
+      entry.streamContentEnablePending = false;
+      if (response?.bufferedData) {
+        this.appendStreamText(requestId, response.bufferedData, true);
+      }
+    } catch (err) {
+      entry.streamContentEnablePending = false;
+      entry.streamContentError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  private appendStreamText(requestId: string, base64Data: string, buffered: boolean): void {
+    const entry = this.streamRequestsById.get(requestId);
+    if (!entry) return;
+
+    let decoded = "";
+    try {
+      decoded = Buffer.from(base64Data, "base64").toString("utf8");
+    } catch (err) {
+      entry.streamContentError = err instanceof Error ? err.message : String(err);
+      return;
+    }
+    if (!decoded) return;
+
+    entry.textLength += decoded.length;
+    if (buffered) {
+      entry.bufferedDataLength += decoded.length;
+    }
+    entry.lastChunkAt = Date.now();
+    entry.text += decoded;
+    if (entry.text.length > MAX_STREAM_TEXT) {
+      entry.text = entry.text.slice(-MAX_STREAM_TEXT);
+    }
+  }
+
+  private isStreamRequestUrl(url: string): boolean {
+    return url.includes("/rest/sse/");
+  }
+
+  private isEventStreamMime(mimeType: string | undefined): boolean {
+    return (mimeType ?? "").toLowerCase().includes("text/event-stream");
+  }
+
+  private pushEventSource(entry: EventSourceEntry): void {
+    this.eventSourceBuffer.push(entry);
+    if (this.eventSourceBuffer.length > MAX_EVENT_SOURCE) {
+      this.eventSourceBuffer.splice(0, this.eventSourceBuffer.length - MAX_EVENT_SOURCE);
+    }
+  }
+
+  private pushWebSocketFrame(entry: WebSocketFrameEntry): void {
+    this.webSocketBuffer.push(entry);
+    if (this.webSocketBuffer.length > MAX_WEBSOCKET) {
+      this.webSocketBuffer.splice(0, this.webSocketBuffer.length - MAX_WEBSOCKET);
+    }
+  }
+
   async evaluate(expression: string): Promise<EvaluateResult> {
     this.ensureClient();
-    return (await this.client!.Runtime.evaluate({
+    const evalPromise = this.client!.Runtime.evaluate({
       expression,
       awaitPromise: true,
       returnByValue: true,
-    })) as EvaluateResult;
+    }) as Promise<EvaluateResult>;
+    return Promise.race([
+      evalPromise,
+      new Promise<EvaluateResult>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Runtime.evaluate timed out after ${EVALUATE_TIMEOUT_MS}ms`)),
+          EVALUATE_TIMEOUT_MS,
+        ),
+      ),
+    ]);
   }
 
   async safeEvaluate(expression: string): Promise<EvaluateResult> {
@@ -806,7 +1293,12 @@ export class CometCDPClient {
     if (await this.isOnPerplexityTab()) return true;
     try {
       const targets = await this.listTargets();
-      if (!targets.some((t) => t.id === this.ownedTargetId)) return false;
+      if (!targets.some((t) => t.id === this.ownedTargetId)) {
+        const replacement = this.findRecoverablePerplexityTarget(targets);
+        if (!replacement) return false;
+        await this.connect(replacement.id, { externalReplacement: true });
+        return true;
+      }
       await this.connect(this.ownedTargetId);
       return true;
     } catch {

@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { CometAI } from "./comet-ai.js";
 import {
+  isCompletedCometStatus,
+  saveCometStatusResult,
+} from "./result-capture.js";
+import { cometResultStore } from "./result-store.js";
+import {
   CometCDPClient,
+  cdpCloseTab,
   cdpGetVersion,
   cdpListTargets,
   cdpNewTab,
@@ -22,6 +28,9 @@ export interface CometTask {
 
   lock: Promise<void>;
   attachedKind: AttachedKind;
+  autoCloseOnCompletion?: boolean;
+
+  preexistingTargetIds: ReadonlySet<string>;
 }
 
 function isSidecarUrl(url: string): boolean {
@@ -29,7 +38,8 @@ function isSidecarUrl(url: string): boolean {
 }
 
 function isThreadUrl(url: string): boolean {
-  return /(^|\.)perplexity\.ai\//.test(url) && !isSidecarUrl(url);
+  if (isSidecarUrl(url)) return false;
+  return /perplexity\.ai\/(search|thread)\//.test(url);
 }
 
 export interface AttachableTarget {
@@ -135,10 +145,13 @@ function envIntMs(name: string, fallback: number): number {
 
 export class TaskRegistry {
   private tasks = new Map<string, CometTask>();
+  private pendingTabIds = new Set<string>();
   private idleTimer: NodeJS.Timeout | null = null;
 
   private readonly idleTtlMs = envIntMs("COMET_TASK_IDLE_TTL_MS", 30 * 60 * 1000);
   private readonly idleSweepMs = envIntMs("COMET_TASK_IDLE_SWEEP_MS", 60 * 1000);
+  private readonly autoSidecarWaitMs = envIntMs("COMET_AUTO_SIDECAR_WAIT_MS", 2_000);
+  private windowFittedOnce = false;
 
   async create(
     label?: string,
@@ -164,11 +177,31 @@ export class TaskRegistry {
     let targetId: string;
     let attachedKind: "new" | "sidecar" | "thread" = "new";
 
+    const preexistingTargetIds: ReadonlySet<string> = await (async () => {
+      try {
+        const targets = await cdpListTargets();
+        return new Set(targets.filter((t) => t.type === "page").map((t) => t.id));
+      } catch {
+        return new Set<string>();
+      }
+    })();
+
+    let pendingClaim: string | undefined;
+    let openedByUs: string | undefined;
+    let registered = false;
+    const claimTab = (id: string) => {
+      pendingClaim = id;
+      this.pendingTabIds.add(id);
+    };
+
+    try {
+
     if (attachMode !== "new") {
       await report(0, `looking for existing ${attachMode} target`);
-      const ownedTabIds = new Set(
-        [...this.tasks.values()].map((t) => t.client.targetId).filter(Boolean) as string[],
-      );
+      const ownedTabIds = new Set<string>([
+        ...([...this.tasks.values()].map((t) => t.client.targetId).filter(Boolean) as string[]),
+        ...this.pendingTabIds,
+      ]);
       const existing = await findPerplexityTarget(attachMode, {
         targetId: opts.targetId,
         urlContains: opts.urlContains,
@@ -178,6 +211,7 @@ export class TaskRegistry {
       if (existing && "id" in existing) {
         targetId = existing.id;
         attachedKind = existing.kind;
+        claimTab(targetId);
       } else if (existing && "error" in existing) {
         const lines = [existing.error];
         if (existing.candidates.length > 0) {
@@ -188,9 +222,32 @@ export class TaskRegistry {
         }
         throw new Error(lines.join("\n"));
       } else if (attachMode === "auto") {
-        const tab = await cdpNewTab("https://www.perplexity.ai/");
-        await new Promise((r) => setTimeout(r, 800));
-        targetId = tab.id;
+        const deadline = Date.now() + this.autoSidecarWaitMs;
+        let attached: { id: string; kind: AttachedKind } | null = null;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 250));
+          const retry = await findPerplexityTarget("auto", {
+            urlContains: opts.urlContains,
+            titleContains: opts.titleContains,
+            ownedTabIds,
+          });
+          if (retry && "id" in retry) {
+            attached = { id: retry.id, kind: retry.kind };
+            break;
+          }
+        }
+        if (attached) {
+          targetId = attached.id;
+          attachedKind = attached.kind;
+          claimTab(targetId);
+        } else {
+          await report(0, "no existing Perplexity surface — opening fresh tab");
+          const tab = await cdpNewTab("https://www.perplexity.ai/");
+          targetId = tab.id;
+          openedByUs = targetId;
+          claimTab(targetId);
+          await new Promise((r) => setTimeout(r, 800));
+        }
       } else {
         throw new Error(
           `No existing Comet ${attachMode} target found. ` +
@@ -200,13 +257,34 @@ export class TaskRegistry {
     } else {
       await report(0, "opening fresh Perplexity tab");
       const tab = await cdpNewTab("https://www.perplexity.ai/");
-      await new Promise((r) => setTimeout(r, 800));
       targetId = tab.id;
+      openedByUs = targetId;
+      claimTab(targetId);
+      await new Promise((r) => setTimeout(r, 800));
     }
 
     await report(1, "attaching CDP socket");
     const client = new CometCDPClient();
     await client.connect(targetId);
+
+    if (!this.windowFittedOnce && process.env.COMET_AUTO_FIT_WINDOW !== "false") {
+      this.windowFittedOnce = true;
+      const mode = process.env.COMET_AUTO_FIT_WINDOW_MODE === "fullscreen" ? "fullscreen" : "maximize";
+      try {
+        const fit = await client.fitWindowToDisplay({ mode });
+        logger.info(
+          "Comet window fit to display",
+          { ok: fit.ok, state: fit.state, width: fit.width, height: fit.height, error: fit.error },
+          { privacySafe: true },
+        );
+      } catch (err) {
+        logger.warn(
+          "Comet window fit failed",
+          { error: err instanceof Error ? err.message : String(err) },
+          { privacySafe: true },
+        );
+      }
+    }
 
     if (attachedKind === "new") {
       await report(2, "navigating to perplexity.ai");
@@ -251,8 +329,10 @@ export class TaskRegistry {
       lastUsedAt: Date.now(),
       lock: Promise.resolve(),
       attachedKind,
+      preexistingTargetIds,
     };
     this.tasks.set(task.id, task);
+    registered = true;
     await report(total, "task ready");
     logger.info(
       "Comet task created",
@@ -266,6 +346,26 @@ export class TaskRegistry {
       { privacySafe: true },
     );
     return task;
+    } finally {
+      if (pendingClaim) this.pendingTabIds.delete(pendingClaim);
+      if (!registered && openedByUs) {
+        const orphanId = openedByUs;
+        try {
+          const ok = await cdpCloseTab(orphanId);
+          logger.warn(
+            "Comet task creation failed — orphan tab cleanup",
+            { targetId: orphanId, closed: ok },
+            { privacySafe: true },
+          );
+        } catch (err) {
+          logger.warn(
+            "Comet task creation failed — orphan tab cleanup error",
+            { targetId: orphanId, error: err instanceof Error ? err.message : String(err) },
+            { privacySafe: true },
+          );
+        }
+      }
+    }
   }
 
   rename(id: string, label: string | undefined): CometTask | null {
@@ -299,7 +399,29 @@ export class TaskRegistry {
 
   private async sweepIdle(): Promise<void> {
     const now = Date.now();
+
+    let liveTargetIds: Set<string> | null = null;
+    try {
+      const targets = await cdpListTargets();
+      liveTargetIds = new Set(targets.filter((t) => t.type === "page").map((t) => t.id));
+    } catch {
+
+    }
+
     for (const task of this.tasks.values()) {
+      if (liveTargetIds && task.client.targetId && !liveTargetIds.has(task.client.targetId)) {
+        logger.info(
+          "Comet task auto-closed (zombie — owned tab no longer exists)",
+          { taskId: task.id, targetId: task.client.targetId },
+          { privacySafe: true },
+        );
+        try {
+          await this.close(task.id);
+        } catch {
+
+        }
+        continue;
+      }
       if (task.keepAlive) continue;
       if (now - task.lastUsedAt < this.idleTtlMs) continue;
       logger.info(
@@ -325,6 +447,10 @@ export class TaskRegistry {
     return [...this.tasks.values()];
   }
 
+  pendingCount(): number {
+    return this.pendingTabIds.size;
+  }
+
   resolve(id?: string): CometTask {
     if (id) {
       const t = this.get(id);
@@ -339,13 +465,16 @@ export class TaskRegistry {
     if (all.length === 0) {
       throw new Error("No active task. Call comet_connect first to create one.");
     }
-    if (all.length > 1) {
-      throw new Error(
-        `${all.length} tasks active. Pass task_id explicitly. ` +
-          `Active: ${all.map((t) => t.id).join(", ")}`,
-      );
-    }
-    return all[0];
+    if (all.length === 1) return all[0];
+    return all.reduce((a, b) => (b.lastUsedAt > a.lastUsedAt ? b : a));
+  }
+
+  resolveOrNull(id?: string): CometTask | null {
+    if (id) return this.get(id) ?? null;
+    const all = this.list();
+    if (all.length === 0) return null;
+    if (all.length === 1) return all[0];
+    return all.reduce((a, b) => (b.lastUsedAt > a.lastUsedAt ? b : a));
   }
 
   async withTask<T>(id: string | undefined, op: (task: CometTask) => Promise<T>): Promise<T> {
@@ -371,27 +500,124 @@ export class TaskRegistry {
     } catch {
 
     }
+
+    await this.persistResultBeforeClose(task);
+
     if (task.attachedKind !== "new") {
       try {
         await task.ai.setTabLabel(null);
       } catch {}
     }
+
     const targetId = task.client.targetId;
+    const childIds = task.client.childTargets;
+    const closedChildren: string[] = [];
+    const attemptedIds = new Set<string>();
+    for (const childId of childIds) {
+      attemptedIds.add(childId);
+      try {
+        const ok = await task.client.closeTab(childId);
+        if (ok) closedChildren.push(childId);
+      } catch {
+
+      }
+    }
+
+    const closedAuxiliary: { id: string; url: string }[] = [];
+    try {
+      const otherTaskTabIds = new Set<string>();
+      for (const other of this.tasks.values()) {
+        if (other.id === id) continue;
+        if (other.client.targetId) otherTaskTabIds.add(other.client.targetId);
+        for (const c of other.client.childTargets) otherTaskTabIds.add(c);
+      }
+      for (const pendingId of this.pendingTabIds) {
+        if (pendingId === targetId) continue;
+        otherTaskTabIds.add(pendingId);
+      }
+      const allTargets = await cdpListTargets();
+      for (const t of allTargets) {
+        if (t.type !== "page") continue;
+        if (task.preexistingTargetIds.has(t.id)) continue;
+        if (t.id === targetId) continue;
+        if (attemptedIds.has(t.id)) continue;
+        if (otherTaskTabIds.has(t.id)) continue;
+        if (t.url.startsWith("chrome://")) continue;
+        if (t.url.startsWith("devtools://")) continue;
+        attemptedIds.add(t.id);
+        try {
+          const ok = await cdpCloseTab(t.id);
+          if (ok) closedAuxiliary.push({ id: t.id, url: t.url });
+        } catch {
+
+        }
+      }
+    } catch {
+
+    }
+
+    let closedOwned = false;
+    if (
+      targetId &&
+      task.attachedKind === "new" &&
+      task.client.shouldCloseTargetOnTaskClose
+    ) {
+      try {
+        closedOwned = await task.client.closeTab(targetId);
+      } catch {
+
+      }
+    }
+
     try {
       await task.client.disconnect();
     } catch {
 
     }
-    if (targetId && task.attachedKind === "new") {
-      try {
-        await task.client.closeTab(targetId);
-      } catch {
 
-      }
-    }
     this.tasks.delete(id);
-    logger.info("Comet task closed", { taskId: id }, { privacySafe: true });
+    logger.info(
+      "Comet task closed",
+      {
+        taskId: id,
+        closedOwnedTab: closedOwned,
+        closedChildTabs: closedChildren.length,
+        closedAuxiliaryTabs: closedAuxiliary.length,
+        closedAuxiliaryUrls: closedAuxiliary.map((a) => a.url),
+        attachedKind: task.attachedKind,
+      },
+      { privacySafe: true },
+    );
     return true;
+  }
+
+  private async persistResultBeforeClose(task: CometTask): Promise<void> {
+    const existing = await cometResultStore.get(task.id);
+    if (existing?.status === "completed") return;
+
+    try {
+      const status = await task.ai.getAgentStatus();
+      const completed = isCompletedCometStatus(status);
+      await saveCometStatusResult(
+        task,
+        status,
+        "task_close",
+        completed ? "completed" : "closed",
+        completed,
+      );
+    } catch (err) {
+      const latest = await cometResultStore.get(task.id);
+      if (latest?.status === "completed") return;
+      await cometResultStore.save({
+        taskId: task.id,
+        label: task.label,
+        status: "closed",
+        error: err instanceof Error ? err.message : String(err),
+        keepAlive: task.keepAlive,
+        autoCloseOnCompletion: task.autoCloseOnCompletion,
+        source: "task_close",
+      });
+    }
   }
 
   async closeAll(): Promise<void> {

@@ -14,8 +14,66 @@ MCP Client  →  comet.mcpgw.app (HTTP)  →  CDP  →  Comet Browser  →  Perp
 ```
 
 Purpose-built so the coding model stays focused on code while Comet handles
-login walls, dynamic pages, and deep agentic research. **31 MCP tools, 3
+login walls, dynamic pages, and deep agentic research. **33 MCP tools, 3
 resources, 3 prompts**, fully isolated per-task parallelism.
+
+---
+
+## Tool / MCP Server description (paste-ready)
+
+Drop this into the "tool description" field of any agent platform (Claude
+Desktop custom MCP, n8n MCP node, Cursor / Cline / Continue, OpenAI Agents
+SDK, LangChain / LlamaIndex tool entry, etc.) so the model understands what
+this server is for and how to call it correctly.
+
+> **comet.mcpgw.app — agentic web browsing via Perplexity Comet**
+>
+> Use this MCP server when a task requires actually using a web browser —
+> visiting URLs, clicking, logging in, filling forms, scraping a specific
+> page, taking an action behind a login wall, or doing deep multi-source
+> research. Perplexity Comet drives the browser; you just send instructions.
+>
+> **Mental model:** one `task_id` = one Perplexity tab = one ongoing chat
+> conversation. Different `task_id`s run in true parallel; the same
+> `task_id` continues the same chat history.
+>
+> **Primary tool:** `comet_ask` — auto-creates a task if needed, sends a
+> prompt, waits for the answer, auto-closes the tab on completion. For
+> browsing tasks, write the prompt as an INSTRUCTION ("Use your browser to
+> navigate to … and …"), not as a keyword query. For multi-turn work, pass
+> `closeAfter:false` and reuse the same `task_id`, then call
+> `comet_task_close` when done. If the run outlives the tool-call window
+> the response comes back as `result_delivery:"async"` — use `comet_poll`
+> or `comet_results` with the returned `task_id` to fetch the final answer.
+>
+> **Reading results:** `structuredContent.completed:true` +
+> `result_delivery:"direct"` ⇒ `response` is the final answer (DONE).
+> `result_delivery:"async"` ⇒ still running, use `comet_poll` /
+> `comet_results`. `partial_response` is incomplete — never present it as
+> final. `status:"input_required"` ⇒ Comet is paused on a confirmation;
+> call `comet_accept_banner` (safe ones) or have the user approve.
+>
+> **Other tools** cover task lifecycle (`comet_connect`, `comet_tasks`,
+> `comet_task_close`), navigation (`comet_navigate`, `comet_back`,
+> `comet_reload`), inspection (`comet_screenshot`, `comet_full_screenshot`,
+> `comet_html`, `comet_dom_query`, `comet_console`, `comet_network`),
+> direct page interaction without the agent (`comet_click`, `comet_type`,
+> `comet_eval`), and browser state (`comet_cookies`, `comet_set_cookie`,
+> `comet_set_viewport`, `comet_block_urls`, `comet_clear_cache`).
+>
+> **Do NOT use** for offline reasoning, code generation, or anything the
+> coding model can answer from its own knowledge — this server costs a
+> real browser tab and a Perplexity request per call.
+
+Short variant (when the platform limits description length to ~500 chars):
+
+> Agentic web browsing via Perplexity Comet. Use `comet_ask` to send an
+> INSTRUCTION (not a keyword query) like "Use your browser to navigate to
+> X and …". Each `task_id` = one tab = one chat thread; same `task_id` +
+> `closeAfter:false` continues the conversation, otherwise the tab
+> auto-closes. Read `structuredContent.response` when `completed:true`;
+> if `result_delivery:"async"`, call `comet_poll` or `comet_results`.
+> Don't use for offline reasoning — every call drives a real browser.
 
 ---
 
@@ -35,10 +93,10 @@ concurrent tasks cannot stomp on each other.
 
 ## Quick start
 
-```bash
-# 1. Run Comet on your workstation with --remote-debugging-port=9222
+Run Comet on your workstation with `--remote-debugging-port=9222`, then start
+the bridge:
 
-# 2. Boot the bridge
+```bash
 docker compose up -d
 ```
 
@@ -70,7 +128,7 @@ npm run dev
 
 ---
 
-## Tools (31)
+## Tools (33)
 
 **Lifecycle**
 | Tool | What it does |
@@ -78,16 +136,18 @@ npm run dev
 | `comet_status` | Bridge health + active task list. Call first when troubleshooting. |
 | `comet_connect` | Create a new isolated task; returns `task_id`. |
 | `comet_tasks` | List active tasks with id, label, tab, URL, age, idle, keepAlive. |
-| `comet_task_close` | Tear down a task (or `all=true`). |
+| `comet_task_close` | Tear down a task (or `all=true`). Closes the owned tab plus any auxiliary tabs the agent opened during the task. |
 | `comet_rename_task` | Change a task's label. |
 | `comet_inspect` | URL/title/age/idle for one task. |
 
 **Driving Perplexity**
 | Tool | What it does |
 |------|--------------|
-| `comet_ask` | Send a prompt and wait for the answer. Supports `closeAfter`, `closeTimeout`, multi-step continuation. Parallel-safe across distinct `task_id`s. |
+| `comet_ask` | Send a prompt and wait for the answer. Completed one-shot tasks auto-close by default; pass `closeAfter=false` for follow-up/inspection. Parallel-safe across distinct `task_id`s. |
 | `comet_poll` | Non-blocking status check; returns the response when COMPLETED. |
 | `comet_get_response` | Peek at the latest visible answer without waiting. |
+| `comet_results` | Read retained task results after tabs were closed or async work finished in the background. |
+| `comet_result_delete` | Delete retained result records early. |
 | `comet_stop` | Click Perplexity's Stop button. |
 | `comet_mode` | Switch search / research / labs / learn. |
 | `comet_accept_banner` | Manual accept of the "Allow browser control" banner. |
@@ -123,6 +183,62 @@ npm run dev
 | `comet_set_viewport` | Override device metrics (mobile emulation). |
 | `comet_block_urls` | `Network.setBlockedURLs` patterns. |
 | `comet_clear_cache` | Browser-wide resets. |
+
+---
+
+## Task lifecycle defaults
+
+`comet_ask` auto-closes completed one-shot task tabs by default. A task stays
+open when Comet is still working, waiting for confirmation, or when the caller
+passes `closeAfter=false`. `closeTimeout` can be used to keep a completed tab
+available briefly for inspection before it closes.
+
+`comet_ask` returns the final answer directly when Comet finishes within the
+tool-call window. If the run is still active at the timeout, the call returns a
+structured async handoff with `task_id`, `next.poll`, `next.partial`, and
+`next.result`; the server keeps a background watcher running and retains the
+final answer for `comet_results task_id=...`.
+
+For asynchronous clients such as n8n, call `comet_ask` with `wait=false` to
+submit immediately and always use the retained-result path. The task inherits
+the same auto-close preference and will close on completion unless
+`closeAfter=false` was set.
+
+### Auxiliary tab cleanup
+
+When Comet's agent browses third-party sites during a task (e.g. opens
+`kayak.com`, `google.com/travel/flights`, etc.), those tabs are not children of
+the Perplexity sidecar in the CDP `openerId` sense — they're spawned by the
+browser-agent overlay. To make `comet_task_close` clean them up reliably, the
+registry takes a snapshot of all existing page targets when a task is created
+(`preexistingTargetIds`). On close, every page target that:
+
+- did not exist when the task was created, AND
+- is not claimed by another active task (registered or pending), AND
+- is not `chrome://` or `devtools://`,
+
+is closed alongside the owned tab. Pre-existing tabs and tabs owned by other
+tasks are never touched.
+
+### Parallel safety
+
+The registry is race-safe across concurrent `create()` and `close()` calls:
+
+- **Pending claims:** A tab is added to `pendingTabIds` the moment `cdpNewTab`
+  returns, before the task is fully registered. Other tasks running `close()`
+  in the same window see this set and skip the tab. `findPerplexityTarget` also
+  consults it, so a concurrent `attach="sidecar"` cannot adopt another task's
+  pending sidecar.
+- **Per-task snapshots:** Each task's `preexistingTargetIds` is taken at its
+  own `create()` start, so tabs created by Task B during Task A's lifetime are
+  never seen as auxiliaries of A.
+- **Live registry lookup:** `otherTaskTabIds` is computed from the live
+  registry at `close()` time, so closes that race in `closeAll()` see each
+  other's owned/child tabs and don't touch them.
+- **Orphan cleanup on failure:** If `create()` opens a tab via `cdpNewTab` but
+  throws before the task is registered, the orphan tab is closed in `finally`.
+- **Zombie detection:** The idle sweep also lists the browser's live page
+  targets and removes registered tasks whose owned tab no longer exists.
 
 ---
 
@@ -231,7 +347,7 @@ Perplexity login flow. The first login always needs a real display.
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `SESSION_TTL_MS` | `1800000` | MCP session inactivity timeout. |
-| `REDIS_URL` | — | Optional Redis for sessions/rate-limit/tasks. |
+| `REDIS_URL` | — | Optional Redis for sessions/rate-limit/tasks/retained results. |
 | `RATE_LIMIT_WINDOW_MS` | `60000` | Default rate-limit window. |
 | `RATE_LIMIT_CLIENT_ID_HEADER` | `x-client-id` | Header used for per-client rate limits. |
 
@@ -243,6 +359,14 @@ Perplexity login flow. The first login always needs a real display.
 | `COMET_TASK_IDLE_SWEEP_MS` | `60000` | Idle sweeper cadence. |
 | `COMET_MAX_CONSOLE` | `500` | Per-task console buffer cap. |
 | `COMET_MAX_NETWORK` | `500` | Per-task network buffer cap. |
+| `COMET_MAX_EVENT_SOURCE` | `1000` | Per-task browser `EventSource` message buffer cap. Comet usually uses fetch-backed SSE, so this is mostly a fallback. |
+| `COMET_MAX_STREAM_REQUESTS` | `100` | Per-task fetch-backed SSE request buffer cap. |
+| `COMET_MAX_STREAM_TEXT` | `250000` | Max decoded SSE text kept per streamed request. |
+| `COMET_MAX_WEBSOCKET` | `1000` | Per-task WebSocket frame buffer cap for Comet agent-channel status. |
+| `COMET_RESULT_TTL_MS` | `2592000000` | Retained result lifetime, default 30 days. |
+| `COMET_RESULT_MAX_TEXT` | `1000000` | Max response text retained per result. |
+| `COMET_RESULT_WATCH_TIMEOUT_MS` | `1800000` | Background watcher timeout for async handoff tasks. |
+| `COMET_RESULT_WATCH_INTERVAL_MS` | `2000` | Background watcher poll interval. |
 | `COMET_ENABLE_EVAL` | `false` | Turn on `comet_eval` (XSS-equivalent inside the tab). |
 
 ### Redis layout (when `REDIS_URL` is set)
@@ -251,13 +375,14 @@ Perplexity login flow. The first login always needs a real display.
 - DB 1: Rate limiting
 - DB 2: MCP tasks
 - DB 3: Tool cache
+- DB 4: Retained Comet results
 
 ---
 
 ## Project layout
 
 - `src/comet/` — CDP client (`cdp-client.ts`), per-task helper (`comet-ai.ts`), task registry.
-- `src/tools/comet/` — the 31 `comet_*` MCP tools.
+- `src/tools/comet/` — the 33 `comet_*` MCP tools.
 - `src/resources/comet/` — overview, hosting guide, recipes.
 - `src/prompts/comet/` — research / parallel-questions / scrape templates.
 - `src/http/` — Express server, auth, routing.
@@ -267,8 +392,28 @@ Perplexity login flow. The first login always needs a real display.
 Drop more `.ts` files into `src/tools/...`, `src/resources/...`, or
 `src/prompts/...` and they are auto-registered at startup.
 
----
+### Workflow runners such as n8n
 
-> Built with help from Claude Code — yes, an MCP for Claude Code, built with Claude Code. 🤖
+For runners with short MCP/tool-call timeouts, submit Comet work without
+holding the call open:
 
+```json
+{ "prompt": "Use your browser to ...", "wait": false }
+```
 
+Then either poll the returned `task_id` with `comet_poll`, or let the server's
+background watcher retain the final answer and read it later:
+
+```json
+{ "name": "comet_results", "arguments": { "task_id": "<task_id>" } }
+```
+
+Completed tasks close automatically after the result is retained unless
+`closeAfter=false` is set. The bridge watches Comet's
+`/rest/sse/perplexity_ask` stream and agent signals via CDP, so status can keep
+moving even when DOM-based UI detection is brittle.
+
+For interactive MCP clients such as Claude Code, leaving `wait=true` is usually
+best: quick runs return the final text directly, while long runs still return a
+machine-readable async handoff instead of failing or leaking a partial answer as
+if it were complete.

@@ -52,18 +52,22 @@ function shutdown(signal: NodeJS.Signals): void {
   sessions.stopCleanup();
   sessions.closeAll("shutdown");
   taskRegistry.stopCleanup();
-  void taskRegistry.closeAll();
+  const tasksClosed = taskRegistry.closeAll().catch((err: unknown) => {
+    logger.warn("taskRegistry.closeAll failed during shutdown", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
 
   server.close((err) => {
     if (err) {
       logger.error("HTTP server close failed", { error: err.message });
-      void closeRedisClient().finally(() => {
+      void Promise.allSettled([tasksClosed, closeRedisClient()]).finally(() => {
         process.exit(1);
       });
       return;
     }
 
-    void closeRedisClient().finally(() => {
+    void Promise.allSettled([tasksClosed, closeRedisClient()]).finally(() => {
       logger.info("Shutdown completed");
       process.exit(0);
     });

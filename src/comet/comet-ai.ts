@@ -1,4 +1,8 @@
-import type { CometCDPClient } from "./cdp-client.js";
+import type {
+  CometCDPClient,
+  StreamRequestEntry,
+  WebSocketFrameEntry,
+} from "./cdp-client.js";
 
 const INPUT_SELECTORS = [
   '[contenteditable="true"]',
@@ -8,6 +12,30 @@ const INPUT_SELECTORS = [
   'input[type="text"]',
 ];
 
+interface StreamSignals {
+  status: "idle" | "working" | "completed";
+  response: string;
+  steps: string[];
+  currentStep: string;
+  sawSse: boolean;
+  sawEventSource: boolean;
+  sawAgent: boolean;
+  sawWebSocket: boolean;
+  textCompleted: boolean;
+  sseClosed: boolean;
+  eventCount: number;
+  streamRequestCount: number;
+  sseChunkCount: number;
+  sseBytes: number;
+  sseTextLength: number;
+  sseActive: boolean;
+  lastEventAt?: number;
+  lastByteAt?: number;
+  error?: string;
+  browserTool?: string;
+  agentAction?: string;
+}
+
 export class CometAI {
   private lastResponseText = "";
   private stableResponseCount = 0;
@@ -15,11 +43,24 @@ export class CometAI {
 
   private pinnedLabel: string | null = null;
   private unsubLoadEvent: (() => void) | null = null;
+  private titleHookScriptId: string | null = null;
 
   constructor(private readonly client: CometCDPClient) {}
 
   async setTabLabel(label: string | null): Promise<void> {
     this.pinnedLabel = label || null;
+
+    if (this.pinnedLabel) {
+      if (this.titleHookScriptId === null) {
+        this.titleHookScriptId = await this.client.addScriptToEvaluateOnNewDocument(
+          this.titleHookSource(),
+        );
+      }
+    } else if (this.titleHookScriptId !== null) {
+      await this.client.removeScriptToEvaluateOnNewDocument(this.titleHookScriptId);
+      this.titleHookScriptId = null;
+    }
+
     await this.applyTabLabel(this.pinnedLabel);
 
     if (this.pinnedLabel && !this.unsubLoadEvent) {
@@ -35,33 +76,127 @@ export class CometAI {
     }
   }
 
+  private titleHookSource(): string {
+    return `
+      (() => {
+        const w = window;
+        if (w.__cometTitleHook) return;
+        try {
+          const desc = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
+          if (!desc || typeof desc.set !== 'function' || typeof desc.get !== 'function') return;
+          const realSet = desc.set;
+          const realGet = desc.get;
+          w.__cometTitleRealSet = realSet;
+          w.__cometTitleRealGet = realGet;
+          const stripExisting = (t) => (t || '').replace(/^\\s*\\[[^\\]]+\\]\\s*/, '');
+          Object.defineProperty(Document.prototype, 'title', {
+            configurable: true,
+            enumerable: desc.enumerable,
+            get: function () { return realGet.call(this); },
+            set: function (v) {
+              const p = w.__cometLabel || '';
+              const stripped = stripExisting(String(v == null ? '' : v));
+              const wanted = p ? p + ' ' + stripped : stripped;
+              realSet.call(this, wanted);
+            },
+          });
+          w.__cometTitleHook = true;
+        } catch {}
+      })();
+    `;
+  }
+
   private async applyTabLabel(label: string | null): Promise<void> {
     const prefix = label ? `[${label}]` : "";
+    const intervalMs = (() => {
+      const raw = process.env.COMET_LABEL_REPAIR_MS;
+      const n = raw ? Number(raw) : NaN;
+      return Number.isFinite(n) && n >= 200 ? Math.floor(n) : 750;
+    })();
     await this.client.evaluate(`
       (() => {
         const prefix = ${JSON.stringify(prefix)};
+        const intervalMs = ${intervalMs};
         const w = window;
         if (w.__cometLabelObs) { try { w.__cometLabelObs.disconnect(); } catch {} }
+        if (w.__cometLabelHeadObs) { try { w.__cometLabelHeadObs.disconnect(); } catch {} }
+        if (w.__cometLabelTimer) { try { clearInterval(w.__cometLabelTimer); } catch {} }
         w.__cometLabel = prefix;
 
         const stripExisting = (t) => (t || '').replace(/^\\s*\\[[^\\]]+\\]\\s*/, '');
+
+        if (!w.__cometTitleHook) {
+          try {
+            const desc = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
+            if (desc && typeof desc.set === 'function' && typeof desc.get === 'function') {
+              const realSet = desc.set;
+              const realGet = desc.get;
+              w.__cometTitleRealSet = realSet;
+              w.__cometTitleRealGet = realGet;
+              Object.defineProperty(Document.prototype, 'title', {
+                configurable: true,
+                enumerable: desc.enumerable,
+                get: function () { return realGet.call(this); },
+                set: function (v) {
+                  const p = w.__cometLabel || '';
+                  const stripped = stripExisting(String(v == null ? '' : v));
+                  const wanted = p ? p + ' ' + stripped : stripped;
+                  realSet.call(this, wanted);
+                },
+              });
+              w.__cometTitleHook = true;
+            }
+          } catch {}
+        }
+
         const apply = () => {
           const stripped = stripExisting(document.title);
           const wanted = prefix ? prefix + ' ' + stripped : stripped;
-          if (document.title !== wanted) document.title = wanted;
+          if (document.title !== wanted) {
+            if (w.__cometTitleRealSet) {
+              try { w.__cometTitleRealSet.call(document, wanted); return; } catch {}
+            }
+            document.title = wanted;
+          }
         };
         apply();
         if (!prefix) return true;
 
-        const titleEl = document.querySelector('title');
-        const head = document.querySelector('head');
+        const head = document.head || document.querySelector('head');
         if (!head) return false;
-        const obs = new MutationObserver(() => {
+
+        let titleObs = null;
+        const bindTitle = () => {
+          if (titleObs) { try { titleObs.disconnect(); } catch {} }
+          const el = document.querySelector('title');
+          if (!el) return;
+          titleObs = new MutationObserver(() => {
+            if (!document.title.startsWith(prefix)) apply();
+          });
+          titleObs.observe(el, { childList: true, characterData: true, subtree: true });
+          w.__cometLabelObs = titleObs;
+        };
+        bindTitle();
+
+        const headObs = new MutationObserver((records) => {
+          for (const r of records) {
+            for (const n of r.addedNodes) {
+              if (n.nodeName === 'TITLE') { bindTitle(); break; }
+            }
+            for (const n of r.removedNodes) {
+              if (n.nodeName === 'TITLE') { bindTitle(); break; }
+            }
+          }
           if (!document.title.startsWith(prefix)) apply();
         });
-        if (titleEl) obs.observe(titleEl, { childList: true, characterData: true, subtree: true });
-        obs.observe(head, { childList: true, subtree: true });
-        w.__cometLabelObs = obs;
+        headObs.observe(head, { childList: true });
+        w.__cometLabelHeadObs = headObs;
+
+        w.__cometLabelTimer = setInterval(() => {
+          if (w.__cometLabel !== prefix) return;
+          if (!document.title.startsWith(prefix)) apply();
+        }, intervalMs);
+
         return true;
       })()
     `);
@@ -339,25 +474,196 @@ export class CometAI {
     this.stableResponseCount = 0;
   }
 
-  async acceptBrowserControlBanner(): Promise<boolean> {
+  getStreamSignals(): StreamSignals {
+    const eventSourceEvents = this.client
+      .getEventSourceEntries({ limit: 1000 })
+      .filter(
+        (entry) =>
+          !entry.url ||
+          entry.url.includes("/rest/sse/perplexity_ask") ||
+          entry.url.includes("/rest/sse/"),
+      );
+    const allStreamRequests = this.client
+      .getStreamRequestEntries({ limit: 20, urlSubstring: "/rest/sse/" })
+      .filter(
+        (entry) =>
+          entry.url.includes("/rest/sse/perplexity_ask") ||
+          entry.url.includes("/rest/sse/"),
+      );
+    const answerStreamRequests = allStreamRequests.filter((entry) =>
+      entry.url.includes("/rest/sse/perplexity_ask"),
+    );
+    const streamRequests =
+      answerStreamRequests.length > 0 ? answerStreamRequests : allStreamRequests;
+    const latestStreamRequest = streamRequests.at(-1);
+    const ssePayloads = streamRequests.flatMap(extractSseDataPayloads);
+
+    const allWsFrames = this.client
+      .getWebSocketFrames({ limit: 250 })
+      .filter((frame) => !isSuggestionWebSocketUrl(frame.url));
+    const agentWsFrames = allWsFrames.filter(
+      (frame) => isAgentWebSocketUrl(frame.url) || !frame.url,
+    );
+
+    let textCompleted = false;
+    let sawAgent = false;
+    let error: string | undefined;
+    let browserTool: string | undefined;
+    let agentAction: string | undefined;
+    const steps: string[] = [];
+    const responseCandidates: string[] = [];
+    const responseChunks: string[] = [];
+
+    for (const event of eventSourceEvents) {
+      const parsed = parseJsonLike(event.data);
+      if (parsed === "[DONE]") {
+        textCompleted = true;
+        continue;
+      }
+      const signal = collectPayloadSignals(parsed);
+      if (signal.textCompleted) textCompleted = true;
+      if (signal.sawAgent) sawAgent = true;
+      if (signal.error && !error) error = signal.error;
+      if (signal.browserTool) browserTool = signal.browserTool;
+      if (signal.agentAction) agentAction = signal.agentAction;
+      steps.push(...signal.steps);
+      responseCandidates.push(...signal.responseCandidates);
+      responseChunks.push(...signal.responseChunks);
+    }
+
+    for (const payload of ssePayloads) {
+      const parsed = parseJsonLike(payload);
+      if (parsed === "[DONE]") {
+        textCompleted = true;
+        continue;
+      }
+      const signal = collectPayloadSignals(parsed);
+      if (signal.textCompleted) textCompleted = true;
+      if (signal.sawAgent) sawAgent = true;
+      if (signal.error && !error) error = signal.error;
+      if (signal.browserTool) browserTool = signal.browserTool;
+      if (signal.agentAction) agentAction = signal.agentAction;
+      steps.push(...signal.steps);
+      responseCandidates.push(...signal.responseCandidates);
+      responseChunks.push(...signal.responseChunks);
+    }
+
+    for (const frame of agentWsFrames) {
+      const signal = collectWebSocketSignals(frame);
+      if (isAgentWebSocketUrl(frame.url) || signal.sawAgent) sawAgent = true;
+      if (signal.agentAction) agentAction = signal.agentAction;
+      if (signal.error && !error) error = signal.error;
+      steps.push(...signal.steps);
+    }
+
+    const response = selectBestResponse(responseCandidates, responseChunks);
+    const uniqueSteps = uniqueTail(steps.map(cleanStep).filter(Boolean), 5);
+    const currentStep =
+      uniqueSteps.at(-1) ||
+      cleanStep(agentAction) ||
+      cleanStep(browserTool) ||
+      "";
+    const sseClosed = Boolean(latestStreamRequest?.finished || latestStreamRequest?.failed);
+    const sawEventSource = eventSourceEvents.length > 0;
+    const sawSse = sawEventSource || streamRequests.length > 0;
+    const sseChunkCount = streamRequests.reduce((sum, entry) => sum + entry.chunkCount, 0);
+    const sseBytes = streamRequests.reduce((sum, entry) => sum + entry.dataLength, 0);
+    const sseTextLength = streamRequests.reduce((sum, entry) => sum + entry.textLength, 0);
+    const lastByteAt = streamRequests.reduce<number | undefined>(
+      (latest, entry) =>
+        entry.lastChunkAt && (!latest || entry.lastChunkAt > latest) ? entry.lastChunkAt : latest,
+      undefined,
+    );
+    const sseActive = streamRequests.some((entry) => !entry.finished && !entry.failed);
+    const status =
+      textCompleted || (sseClosed && Boolean(response))
+        ? "completed"
+        : sawSse || sawAgent
+        ? "working"
+        : "idle";
+
+    return {
+      status,
+      response,
+      steps: uniqueSteps,
+      currentStep,
+      sawSse,
+      sawEventSource,
+      sawAgent,
+      sawWebSocket: allWsFrames.length > 0,
+      textCompleted,
+      sseClosed,
+      eventCount: eventSourceEvents.length + ssePayloads.length,
+      streamRequestCount: streamRequests.length,
+      sseChunkCount,
+      sseBytes,
+      sseTextLength,
+      sseActive,
+      lastEventAt: eventSourceEvents.at(-1)?.ts,
+      lastByteAt,
+      error: error ?? latestStreamRequest?.streamContentError,
+      browserTool,
+      agentAction,
+    };
+  }
+
+  async acceptInFlowConfirmation(opts: { allowDestructive?: boolean } = {}): Promise<{
+    clicked: boolean;
+    kind: "browser_control" | "destructive" | null;
+    text: string;
+  }> {
+    const allowDestructive = Boolean(opts.allowDestructive);
     const result = await this.client.evaluate(`
       (() => {
-        const allowTexts = [
-          'allow once', 'allow this time', 'allow',
-          'einmal erlauben', 'erlauben', 'zulassen',
-        ];
-
-        const visibleButtons = [...document.querySelectorAll('button')]
-          .filter((btn) => !btn.disabled && btn.offsetParent !== null);
-
-        for (const btn of visibleButtons) {
+        const SAFE = ${JSON.stringify([
+          'continue', 'proceed', 'next', 'ok', 'okay', 'got it', 'understood',
+          'allow', 'allow once', 'allow this time',
+          'fortfahren', 'weiter', 'verstanden', 'erlauben', 'einmal erlauben', 'zulassen',
+        ])};
+        const DESTR = ${JSON.stringify([
+          'send', 'submit', 'confirm', 'pay', 'purchase', 'buy', 'checkout',
+          'place order', 'sign in', 'log in', 'authorize', 'approve', 'delete', 'post', 'publish',
+          'senden', 'absenden', 'bestätigen', 'kaufen', 'bezahlen',
+          'anmelden', 'einloggen', 'genehmigen', 'löschen', 'veröffentlichen',
+        ])};
+        const allowDestructive = ${JSON.stringify(allowDestructive)};
+        const matchText = (t, list) => list.some((x) => t === x || t === x + '.' || t.startsWith(x + ' '));
+        const visible = [...document.querySelectorAll('button')]
+          .filter((b) => !b.disabled && b.offsetParent !== null);
+        for (const btn of visible) {
           const t = (btn.innerText || '').trim().toLowerCase();
-          if (allowTexts.some((a) => t === a || t === a + '.' || t.startsWith(a))) {
-            btn.click();
-            return true;
+          if (!t) continue;
+          if (matchText(t, SAFE)) {
+            const card = btn.closest('[role="dialog"], [class*="banner"], [class*="confirm"], [class*="prompt"], div');
+            const text = card ? (card.innerText || '').trim().substring(0, 400) : t;
+            try { btn.click(); } catch {}
+            return { clicked: true, kind: 'browser_control', text };
           }
         }
+        if (allowDestructive) {
+          for (const btn of visible) {
+            const t = (btn.innerText || '').trim().toLowerCase();
+            if (!t) continue;
+            if (matchText(t, DESTR)) {
+              const card = btn.closest('[role="dialog"], [class*="banner"], [class*="confirm"], [class*="prompt"], [class*="card"]');
+              if (!card) continue;
+              const text = (card.innerText || '').trim().substring(0, 400);
+              try { btn.click(); } catch {}
+              return { clicked: true, kind: 'destructive', text };
+            }
+          }
+        }
+        return { clicked: false, kind: null, text: '' };
+      })()
+    `);
+    return result.result.value as { clicked: boolean; kind: "browser_control" | "destructive" | null; text: string };
+  }
 
+  async acceptBrowserControlBanner(): Promise<boolean> {
+    const inFlow = await this.acceptInFlowConfirmation({ allowDestructive: false });
+    if (inFlow.clicked) return true;
+    const result = await this.client.evaluate(`
+      (() => {
         for (const useEl of document.querySelectorAll('svg use')) {
           const href = useEl.getAttribute('xlink:href') || useEl.getAttribute('href');
           if (href !== '#pplx-icon-click') continue;
@@ -397,7 +703,7 @@ export class CometAI {
   }
 
   async getAgentStatus(): Promise<{
-    status: "idle" | "working" | "completed";
+    status: "idle" | "working" | "completed" | "awaiting_input";
     steps: string[];
     currentStep: string;
     response: string;
@@ -405,6 +711,29 @@ export class CometAI {
     agentBrowsingUrl: string;
     isStable: boolean;
     surface: "sidecar" | "thread" | "home";
+    awaitingInput: boolean;
+    confirmationPrompt: string;
+    confirmationKind: "browser_control" | "safe" | "destructive" | "unknown" | null;
+    stream: {
+      status: "idle" | "working" | "completed";
+      sawSse: boolean;
+      sawEventSource: boolean;
+      sawAgent: boolean;
+      sawWebSocket: boolean;
+      textCompleted: boolean;
+      sseClosed: boolean;
+      eventCount: number;
+      streamRequestCount: number;
+      sseChunkCount: number;
+      sseBytes: number;
+      sseTextLength: number;
+      sseActive: boolean;
+      responseLength: number;
+      currentStep: string;
+      lastEventAt?: number;
+      lastByteAt?: number;
+      error?: string;
+    };
   }> {
     let agentBrowsingUrl = "";
     try {
@@ -436,6 +765,64 @@ export class CometAI {
             break;
           }
         }
+
+        const SAFE_CONFIRM_TEXTS = [
+          'continue', 'proceed', 'next', 'ok', 'okay', 'got it', 'understood',
+          'allow', 'allow once', 'allow this time',
+          'fortfahren', 'weiter', 'verstanden', 'erlauben', 'einmal erlauben', 'zulassen',
+        ];
+        const DESTRUCTIVE_CONFIRM_TEXTS = [
+          'send', 'submit', 'confirm', 'pay', 'purchase', 'buy', 'checkout',
+          'place order', 'sign in', 'log in', 'authorize', 'approve', 'delete', 'post', 'publish',
+          'senden', 'absenden', 'bestätigen', 'best\\u00e4tigen', 'kaufen', 'bezahlen',
+          'anmelden', 'einloggen', 'genehmigen', 'löschen', 'l\\u00f6schen', 'veröffentlichen', 'ver\\u00f6ffentlichen',
+        ];
+        const matchText = (txt, list) => list.some((t) => txt === t || txt === t + '.' || txt.startsWith(t + ' '));
+
+        let confirmationKind = null;
+        let confirmationPrompt = '';
+
+        const allowVisible = [...document.querySelectorAll('button')]
+          .filter((b) => !b.disabled && b.offsetParent !== null);
+        for (const btn of allowVisible) {
+          const t = (btn.innerText || '').trim().toLowerCase();
+          if (!t) continue;
+          if (matchText(t, SAFE_CONFIRM_TEXTS)) {
+            const card = btn.closest('[role="dialog"], [class*="banner"], [class*="confirm"], [class*="prompt"], form, section, article, div');
+            confirmationKind = 'browser_control';
+            const ctxText = card ? (card.innerText || '').trim() : (btn.innerText || '').trim();
+            confirmationPrompt = ctxText.substring(0, 400);
+            break;
+          }
+        }
+        if (!confirmationKind) {
+          for (const btn of allowVisible) {
+            const t = (btn.innerText || '').trim().toLowerCase();
+            if (!t) continue;
+            if (matchText(t, DESTRUCTIVE_CONFIRM_TEXTS)) {
+              const card = btn.closest('[role="dialog"], [class*="banner"], [class*="confirm"], [class*="prompt"], [class*="card"]');
+              if (!card) continue;
+              const ctxText = (card.innerText || '').trim();
+              const looksLikeAgentCard = /agent|comet|assistant|allow|confirm|verify|review|proceed|send|order|pay/i.test(ctxText);
+              if (!looksLikeAgentCard) continue;
+              confirmationKind = 'destructive';
+              confirmationPrompt = ctxText.substring(0, 400);
+              break;
+            }
+          }
+        }
+        if (!confirmationKind) {
+          for (const useEl of document.querySelectorAll('svg use')) {
+            const href = useEl.getAttribute('xlink:href') || useEl.getAttribute('href');
+            if (href !== '#pplx-icon-click') continue;
+            const banner = useEl.closest('[class*="banner"], .relative, div');
+            if (!banner) continue;
+            confirmationKind = 'browser_control';
+            confirmationPrompt = (banner.innerText || '').trim().substring(0, 400);
+            break;
+          }
+        }
+        const awaitingInput = confirmationKind !== null;
 
         let inputReadyForFollowUp = false;
         const askInput = document.getElementById('ask-input');
@@ -474,7 +861,11 @@ export class CometAI {
 
         let answerEls = [...document.querySelectorAll('[id^="markdown-content-"]')];
         if (answerEls.length === 0) {
-          answerEls = [...document.querySelectorAll('[class*="prose"]')]
+          answerEls = [...document.querySelectorAll(
+            '[class*="prose"], [data-message-author-role="assistant"], [data-role="assistant"], ' +
+            '[data-testid*="assistant"], [data-testid*="message"], [class*="assistant-message"], ' +
+            '[class*="MessageBubble"], [class*="message-bubble"], [class*="chat-message"]'
+          )]
             .filter(el => !el.closest('nav, aside, header, footer, [contenteditable], [data-ask-input-container]'));
         }
         const lastAnswer = answerEls[answerEls.length - 1] || null;
@@ -483,6 +874,14 @@ export class CometAI {
           if (text.length < 1) return false;
           return !['Library', 'Discover', 'Spaces', 'Finance', 'Account', 'Upgrade', 'Home', 'Search'].some(ui => text.startsWith(ui));
         });
+
+        const agenticCompletionPatterns = [
+          "I've completed", "I have completed", "Task complete", "Task completed",
+          "I've finished", "I have finished", "Here's what I found", "Here is what I found",
+          "Here's what I did", "Here is what I did", "Done.", "All done",
+          "Successfully completed", "Aufgabe abgeschlossen", "Fertig.", "Erledigt"
+        ];
+        const hasAgenticCompletion = agenticCompletionPatterns.some(p => body.includes(p));
 
         const workingPatterns = [
           'Working', 'Searching', 'Reviewing sources', 'Preparing to assist',
@@ -494,16 +893,30 @@ export class CometAI {
         ];
         const hasWorkingText = workingPatterns.some(p => body.includes(p));
 
+        const declinePatterns = [
+          'Cancelled', 'Canceled', 'Declined', 'Denied', 'Action declined',
+          'Permission denied', 'Stopped by user',
+          'Abgebrochen', 'Abgelehnt', 'Verweigert',
+        ];
+        const declineHit = declinePatterns.find((p) => body.includes(p));
+        const wasDeclined = Boolean(declineHit) && !hasActiveStopButton && !hasLoadingSpinner;
+
         let status = 'idle';
 
-        if (hasActiveStopButton) {
+        if (wasDeclined) {
+          status = 'completed';
+        } else if (awaitingInput && !hasLoadingSpinner && !hasThinkingIndicator) {
+          status = 'awaiting_input';
+        } else if (hasActiveStopButton) {
           status = 'working';
         } else if (hasLoadingSpinner || hasThinkingIndicator) {
           status = 'working';
         }
         else if (hasStepsCompleted || hasFinishedMarker) status = 'completed';
+        else if (hasAgenticCompletion && !hasActiveStopButton && !hasLoadingSpinner) status = 'completed';
         else if (inputReadyForFollowUp && hasProseContent) status = 'completed';
         else if (onSearchPage && !hasActiveStopButton && hasProseContent) status = 'completed';
+        else if (onSidecar && !hasActiveStopButton && !hasLoadingSpinner && hasProseContent) status = 'completed';
         else if (hasAskFollowUp && hasProseContent) status = 'completed';
         else if (hasSourcesIndicator && hasProseContent) status = 'completed';
         else if (hasReviewedSources) status = 'completed';
@@ -585,8 +998,20 @@ export class CometAI {
               })
               .map(el => el.innerText.trim());
             if (validTexts.length > 0) {
-              response = validTexts.slice(-3).join('\\n\\n');
+              const seen = new Set();
+              const unique = [];
+              for (const t of validTexts) {
+                const key = t.substring(0, 120);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                unique.push(t);
+              }
+              response = unique.slice(-3).join('\\n\\n');
             }
+          }
+
+          if (wasDeclined && (!response || response.length < 5)) {
+            response = 'Comet reported: ' + declineHit;
           }
 
           if (response) {
@@ -610,32 +1035,101 @@ export class CometAI {
           status,
           steps: [...new Set(steps)].slice(-5),
           currentStep: steps.length > 0 ? steps[steps.length - 1] : '',
-          response: response.substring(0, 8000),
+          response: response.substring(0, 32000),
           hasStopButton: hasActiveStopButton,
-          surface: onSidecar ? 'sidecar' : (onSearchPage ? 'thread' : 'home')
+          surface: onSidecar ? 'sidecar' : (onSearchPage ? 'thread' : 'home'),
+          awaitingInput,
+          confirmationPrompt,
+          confirmationKind
         };
       })()
     `);
 
     const statusResult = result.result.value as {
-      status: "idle" | "working" | "completed";
+      status: "idle" | "working" | "completed" | "awaiting_input";
       steps: string[];
       currentStep: string;
       response: string;
       hasStopButton: boolean;
       surface: "sidecar" | "thread" | "home";
+      awaitingInput: boolean;
+      confirmationPrompt: string;
+      confirmationKind: "browser_control" | "safe" | "destructive" | "unknown" | null;
     };
 
-    const isStable = this.isResponseStable(statusResult.response);
+    const stream = this.getStreamSignals();
+    let response = statusResult.response;
+    if (
+      stream.response &&
+      (!response || (stream.textCompleted && stream.response.length > response.length * 1.15))
+    ) {
+      response = stream.response;
+    }
 
-    if (isStable && statusResult.response.length > 50 && !statusResult.hasStopButton) {
-      statusResult.status = "completed";
+    const combinedSteps = uniqueTail(
+      [...statusResult.steps, ...stream.steps].map(cleanStep).filter(Boolean),
+      5,
+    );
+    let currentStep =
+      stream.currentStep || statusResult.currentStep || combinedSteps.at(-1) || "";
+
+    let combinedStatus = statusResult.status;
+    if (
+      stream.status === "completed" &&
+      !statusResult.awaitingInput &&
+      Boolean(response)
+    ) {
+      combinedStatus = "completed";
+    } else if (
+      stream.status === "working" &&
+      combinedStatus === "idle" &&
+      !statusResult.awaitingInput
+    ) {
+      combinedStatus = "working";
+    }
+
+    const isStable = this.isResponseStable(response);
+
+    if (
+      isStable &&
+      response.length > 50 &&
+      !statusResult.hasStopButton &&
+      !statusResult.awaitingInput
+    ) {
+      combinedStatus = "completed";
+    }
+    if (combinedStatus === "completed" && !statusResult.hasStopButton) {
+      currentStep = "";
     }
 
     return {
       ...statusResult,
+      status: combinedStatus,
+      steps: combinedSteps.length > 0 ? combinedSteps : statusResult.steps,
+      currentStep,
+      response,
       agentBrowsingUrl,
       isStable,
+      stream: {
+        status: stream.status,
+        sawSse: stream.sawSse,
+        sawEventSource: stream.sawEventSource,
+        sawAgent: stream.sawAgent,
+        sawWebSocket: stream.sawWebSocket,
+        textCompleted: stream.textCompleted,
+        sseClosed: stream.sseClosed,
+        eventCount: stream.eventCount,
+        streamRequestCount: stream.streamRequestCount,
+        sseChunkCount: stream.sseChunkCount,
+        sseBytes: stream.sseBytes,
+        sseTextLength: stream.sseTextLength,
+        sseActive: stream.sseActive,
+        responseLength: stream.response.length,
+        currentStep: stream.currentStep,
+        lastEventAt: stream.lastEventAt,
+        lastByteAt: stream.lastByteAt,
+        error: stream.error,
+      },
     };
   }
 
@@ -809,4 +1303,242 @@ export class CometAI {
     `);
     return sel.result.value as { success: boolean; error?: string };
   }
+}
+
+interface PayloadSignals {
+  textCompleted: boolean;
+  sawAgent: boolean;
+  steps: string[];
+  responseCandidates: string[];
+  responseChunks: string[];
+  error?: string;
+  browserTool?: string;
+  agentAction?: string;
+}
+
+function emptyPayloadSignals(): PayloadSignals {
+  return {
+    textCompleted: false,
+    sawAgent: false,
+    steps: [],
+    responseCandidates: [],
+    responseChunks: [],
+  };
+}
+
+function parseJsonLike(value: string): unknown {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed === "[DONE]") return "[DONE]";
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return trimmed;
+  }
+}
+
+function extractSseDataPayloads(entry: StreamRequestEntry): string[] {
+  if (!entry.text) return [];
+  const out: string[] = [];
+  const normalized = entry.text.replace(/\r\n/g, "\n");
+  for (const block of normalized.split(/\n\n+/)) {
+    const dataLines: string[] = [];
+    for (const rawLine of block.split("\n")) {
+      const line = rawLine.trimEnd();
+      if (!line.startsWith("data:")) continue;
+      dataLines.push(line.slice(5).replace(/^ /, ""));
+    }
+    const payload = dataLines.join("\n").trim();
+    if (payload) out.push(payload);
+  }
+  return out;
+}
+
+function isSuggestionWebSocketUrl(url: string | undefined): boolean {
+  return Boolean(url && /suggest\.perplexity\.ai\/suggest\/ws/i.test(url));
+}
+
+function isAgentWebSocketUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  return /agent|entropy|browser|computer|chrome-extension/i.test(url);
+}
+
+function collectWebSocketSignals(frame: WebSocketFrameEntry): PayloadSignals {
+  const parsed = parseJsonLike(frame.payloadData);
+  const signals = collectPayloadSignals(parsed);
+  if (isAgentWebSocketUrl(frame.url)) {
+    signals.sawAgent = true;
+  }
+  return signals;
+}
+
+function collectPayloadSignals(value: unknown): PayloadSignals {
+  const out = emptyPayloadSignals();
+  visitPayload(value, [], out);
+  return out;
+}
+
+function visitPayload(
+  value: unknown,
+  path: string[],
+  out: PayloadSignals,
+): void {
+  if (value === null || value === undefined) return;
+
+  if (Array.isArray(value)) {
+    for (const item of value) visitPayload(item, path, out);
+    return;
+  }
+
+  if (typeof value !== "object") return;
+
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    const lowerKey = key.toLowerCase();
+    const nextPath = [...path, lowerKey];
+
+    if (lowerKey.includes("entropy_request") || lowerKey === "browser_tool") {
+      out.sawAgent = true;
+    }
+
+    if (
+      typeof child === "boolean" &&
+      (lowerKey === "text_completed" ||
+        lowerKey === "textcompleted" ||
+        lowerKey === "completed" ||
+        lowerKey === "done")
+    ) {
+      out.textCompleted = out.textCompleted || child;
+    }
+
+    if (typeof child === "string") {
+      const text = child.trim();
+      if (!text) continue;
+
+      if (lowerKey === "step_type") {
+        out.browserTool = text;
+        if (text === "ENTROPY_REQUEST") out.sawAgent = true;
+      } else if (lowerKey === "action") {
+        out.agentAction = text;
+        out.sawAgent = true;
+      } else if (lowerKey === "status" || lowerKey.includes("step")) {
+        if (isLikelyStepSignal(text, lowerKey)) out.steps.push(text);
+      } else if (lowerKey.includes("error")) {
+        out.error = out.error ?? text.substring(0, 500);
+      }
+
+      if (isLikelyResponseKey(lowerKey, nextPath) && isLikelyResponseText(text)) {
+        if (isChunkKey(lowerKey)) {
+          out.responseChunks.push(text);
+        } else {
+          out.responseCandidates.push(text);
+        }
+      }
+    }
+
+    visitPayload(child, nextPath, out);
+  }
+}
+
+function isLikelyResponseKey(key: string, path: string[]): boolean {
+  if (key === "text_completed") return false;
+  if (
+    key.includes("uuid") ||
+    key.endsWith("id") ||
+    key.includes("_id") ||
+    key.includes("url") ||
+    key.includes("slug") ||
+    key.includes("model") ||
+    key.includes("source") ||
+    key.includes("mode") ||
+    key.includes("header") ||
+    key.includes("path")
+  ) {
+    return false;
+  }
+
+  if (
+    [
+      "answer",
+      "content",
+      "delta",
+      "final_answer",
+      "markdown",
+      "message",
+      "output",
+      "response",
+      "text",
+      "token",
+    ].includes(key)
+  ) {
+    return true;
+  }
+
+  return path.some((part) =>
+    ["answer", "assistant", "content", "message", "response"].includes(part),
+  );
+}
+
+function isChunkKey(key: string): boolean {
+  return key === "delta" || key === "token";
+}
+
+function isLikelyResponseText(text: string): boolean {
+  if (text.length < 2) return false;
+  if (/^https?:\/\//i.test(text)) return false;
+  if (/^[a-f0-9-]{20,}$/i.test(text)) return false;
+  if (/^[A-Z_]+$/.test(text) && text.length < 40) return false;
+  if (/^[\[{].*[\]}]$/.test(text) && text.length > 500) return false;
+  return true;
+}
+
+function isLikelyStepSignal(text: string, key: string): boolean {
+  if (text.length > 160) return false;
+  if (text.startsWith("/")) return false;
+  if (key === "status") {
+    return /^[A-Za-z][A-Za-z0-9 _-]{1,80}$/.test(text);
+  }
+  return true;
+}
+
+function selectBestResponse(candidates: string[], chunks: string[]): string {
+  const bestCandidate =
+    candidates
+      .map(cleanResponse)
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)[0] ?? "";
+  const joinedChunks = cleanResponse(chunks.join(""));
+
+  if (!bestCandidate) return joinedChunks.substring(0, 32_000);
+  if (joinedChunks.length > bestCandidate.length * 2 && bestCandidate.length < 500) {
+    return joinedChunks.substring(0, 32_000);
+  }
+  return bestCandidate.substring(0, 32_000);
+}
+
+function cleanResponse(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim();
+}
+
+function cleanStep(step: string | undefined): string {
+  if (!step) return "";
+  return step
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .substring(0, 140);
+}
+
+function uniqueTail(values: string[], limit: number): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const value of values) {
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(value);
+  }
+  return unique.slice(-limit);
 }
