@@ -74,7 +74,11 @@ function formatRecord(record: CometResultRecord, includeResponse: boolean): stri
 const tool = defineTool({
   name: "comet_results",
   title: "Read retained Comet results",
-  description: "Read Comet task results retained by the server. Use task_id to fetch one full result after its tab was auto-closed, or omit task_id to list recent retained results. Results are kept in Redis when REDIS_URL is configured and fall back to process memory otherwise.",
+  description:
+    "Read Comet task results retained by the server. Use task_id to fetch one full result after its tab was auto-closed, or omit task_id to list recent retained results. Results are kept in Redis when REDIS_URL is configured and fall back to process memory otherwise.\n\n" +
+    "When to call this (for agents):\n" +
+    "  • After `comet_ask` returned `result_delivery:\"async\"` (timeout, wait=false, or input_required) — call this with the same `task_id` to fetch the retained final answer once the background watcher saves it.\n" +
+    "  • Reading the response: in `structuredContent.result`, when `status:\"completed\"` the `response` field is the final answer. `status:\"working\"` means the watcher has not yet captured a completed run — try again later or use `comet_poll` if the task is still active. `status:\"failed\"` / `\"timeout\"` → read `error`.",
   rateLimit: { tool: { max: 120 } },
   annotations: {
     readOnlyHint: true,

@@ -73,7 +73,30 @@ function asyncHandoffText(
 const tool = defineTool({
   name: "comet_ask",
   title: "Ask Comet",
-  description: "Send a prompt to Comet/Perplexity and wait for the response. If `task_id` is omitted, reuses the most-recently-used task or auto-creates one (so you do NOT need to call comet_connect first — just call comet_ask). Multiple comet_ask calls can run in parallel as long as each targets a different task_id. By default, completed one-shot tasks auto-close their task tab; pass `closeAfter=false` to keep the tab for follow-up work or inspection. The tab is kept open when Comet is still working or waiting for user/agent confirmation. Use comet_task_close to stop a multi-step task explicitly.",
+  description:
+    "Send a prompt to Comet/Perplexity and wait for the response. Each `task_id` = one Perplexity tab = one ongoing conversation. If `task_id` is omitted, the most-recently-used task is reused (or one is auto-created), so you do NOT have to call `comet_connect` first. Multiple `comet_ask` calls run in true parallel as long as each targets a different `task_id`; calls against the same `task_id` serialize behind a per-task lock and continue the same chat history.\n\n" +
+    "How to phrase the `prompt` (IMPORTANT):\n" +
+    "  • For pure Q&A (no website needed) just write the question: `\"What is the capital of Iceland?\"`.\n" +
+    "  • For agentic / browsing tasks (anything that needs Comet to actually navigate, click, log in, fill forms, scrape a specific page, take an action) you MUST write the prompt as an INSTRUCTION to Comet, not as a question to a search engine. Comet only switches into agent mode when the prompt tells it to use the browser. Examples:\n" +
+    "      ✅ \"Use your browser to navigate to https://news.ycombinator.com and tell me the top 5 story titles.\"\n" +
+    "      ✅ \"Open github.com/anthropics/anthropic-sdk-python, go to the Issues tab, and list the 3 oldest open issues.\"\n" +
+    "      ✅ \"Browse to my Gmail inbox and summarize the unread emails from today.\"\n" +
+    "      ❌ \"top 5 HN stories\"   (Comet may answer from cached knowledge instead of browsing)\n" +
+    "      ❌ \"github issues for anthropic-sdk-python\"\n" +
+    "    The bridge auto-rewrites obvious URL/website prompts into agentic form, but explicit instructions are always more reliable.\n\n" +
+    "Tab lifecycle — one task, one tab, one conversation:\n" +
+    "  • One-shot question (default): `comet_ask` with no `closeAfter` → after the answer is captured, the tab AND task auto-close. Don't call `comet_task_close` yourself; it's already gone. Next `comet_ask` opens a fresh tab/conversation.\n" +
+    "  • Multi-turn conversation in the SAME tab: pass `closeAfter:false` and reuse the SAME `task_id` for every follow-up `comet_ask`. The Perplexity chat history is preserved between turns. When done, call `comet_task_close task_id=…` to close the tab.\n" +
+    "  • Fresh chat in an existing task's tab: pass `newChat:true` to navigate that tab back to perplexity.ai/ before sending the prompt (clears the prior conversation, keeps the task).\n" +
+    "  • Inspection window: pass `closeTimeout:5000` (or similar) to keep the tab open for N ms after completion so downstream tools (`comet_screenshot`, `comet_html`, `comet_console`) can inspect it before auto-close.\n" +
+    "  • While Comet is still working OR awaiting confirmation, the tab is NEVER auto-closed regardless of `closeAfter`.\n\n" +
+    "How to read the result (IMPORTANT for agents):\n" +
+    "  • The text content block ALWAYS contains the user-facing answer when one exists — show that to the user.\n" +
+    "  • The `structuredContent` JSON has `status` + `completed` + `result_delivery`:\n" +
+    "      - `completed:true` and `result_delivery:\"direct\"` → `response` IS the final answer. You are DONE. Do NOT call `next.poll` / `next.result` — those are just convenience pointers for follow-ups, not a required next step.\n" +
+    "      - `result_delivery:\"async\"` (with `status:\"working\"` or `\"input_required\"`) → the run is still going. Use `next.poll` until completed, or `next.result` (comet_results) to fetch the retained final answer later. `partial_response` (if present) is INCOMPLETE — never present it as the final answer.\n" +
+    "      - `status:\"failed\"` → read `error`; do not retry blindly.\n" +
+    "  • `wait=false` always returns immediately with `result_delivery:\"async\"` and no answer yet — call `comet_results` later to read the retained final result.",
   rateLimit: { tool: { max: 30 }, client: { max: 10 } },
   annotations: {
     readOnlyHint: false,
@@ -81,7 +104,18 @@ const tool = defineTool({
     openWorldHint: true,
   },
   inputSchema: {
-    prompt: z.string().min(1).describe("Question or task for Comet"),
+    prompt: z
+      .string()
+      .min(1)
+      .describe(
+        "What you want Comet to do. For pure Q&A, write the question normally. " +
+          "For ANY task that requires actually browsing — visiting URLs, clicking, " +
+          "logging in, filling forms, scraping a specific site, taking an action — " +
+          "phrase it as an INSTRUCTION (e.g. \"Use your browser to navigate to X and …\", " +
+          "\"Open …, click …, then report …\"). Comet only enters agent mode when the " +
+          "prompt tells it to use the browser; a bare keyword query may be answered " +
+          "from cached knowledge instead.",
+      ),
     task_id: z
       .string()
       .optional()
@@ -106,9 +140,10 @@ const tool = defineTool({
       .optional()
       .describe(
         "Whether to close the task (and its tab) after a completed response. " +
-          "Defaults to auto-close for completed one-shot work. Set false to keep " +
-          "the tab open for follow-up prompts or inspection. The bridge never " +
-          "auto-closes while Comet is still working or awaiting confirmation.",
+          "Default = auto-close, which is correct for one-shot questions. " +
+          "Set `false` when you plan to send follow-up `comet_ask` calls against " +
+          "the SAME `task_id` (same Perplexity tab, same chat history). The bridge " +
+          "never auto-closes while Comet is still working or awaiting confirmation.",
       ),
     closeTimeout: z
       .number()

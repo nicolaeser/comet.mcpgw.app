@@ -8,7 +8,13 @@ import { cometStatusStructured } from "./_structured.js";
 const tool = defineTool({
   name: "comet_poll",
   title: "Poll Comet status",
-  description: "Non-blocking status check for a task. Returns IDLE | WORKING | COMPLETED, any visible step list, and the agent's browsing URL if it spawned a child tab. When status is COMPLETED, returns the response text directly and retains it for comet_results before any auto-close. Use comet_get_response for partial text.",
+  description:
+    "Non-blocking status check for a task. Returns IDLE | WORKING | COMPLETED, any visible step list, and the agent's browsing URL if it spawned a child tab. When status is COMPLETED, returns the response text directly and retains it for comet_results before any auto-close. Use comet_get_response for partial text.\n\n" +
+    "How to read the result (IMPORTANT for agents):\n" +
+    "  • `structuredContent.completed:true` with `result_delivery:\"direct\"` → `response` IS the final answer. STOP polling and present it.\n" +
+    "  • `result_delivery:\"async\"` and `status:\"working\"` → still running. `partial_response` is incomplete — keep polling, do NOT present it as final.\n" +
+    "  • `status:\"input_required\"` → Comet is paused on a confirmation dialog. Either call `comet_accept_banner` (safe confirmations only) or instruct the user to approve manually, then poll again.\n" +
+    "  • `status:\"idle\"` after a prompt was sent → likely auto-closed already; call `comet_results` for the retained final result.",
   rateLimit: { tool: { max: 120 } },
   annotations: {
     readOnlyHint: true,

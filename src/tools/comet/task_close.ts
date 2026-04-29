@@ -6,7 +6,14 @@ import { errorResult, textResult } from "../_shared/tool-result.js";
 const tool = defineTool({
   name: "comet_task_close",
   title: "Close a Comet task",
-  description: "Tear down a task: waits for any in-flight tool call against it to finish, persists the latest visible result/status for comet_results, closes the underlying Comet tab plus any auxiliary tabs the agent opened during the task, then detaches the CDP socket. Pass `all=true` to close every active task at once. Idempotent — closing a non-existent task_id returns a notice, not an error.",
+  description:
+    "Tear down a task explicitly: waits for any in-flight tool call against it to finish, persists the latest visible result/status for `comet_results`, closes the underlying Perplexity tab plus any auxiliary tabs the agent opened during the task, then detaches the CDP socket.\n\n" +
+    "When to call this:\n" +
+    "  • You opened a multi-turn task with `closeAfter:false` (or `keepAlive:true`) and are now finished with that conversation — call this to close the tab.\n" +
+    "  • You want to abandon a task that is stuck or no longer needed.\n" +
+    "  • Pass `all:true` at the end of a workflow to close every active task at once.\n" +
+    "  • You do NOT need to call this after a one-shot `comet_ask` — the tab and task auto-close when the answer is captured (unless `closeAfter:false` was set).\n\n" +
+    "Idempotent — closing a non-existent `task_id` returns a notice, not an error.",
   rateLimit: { tool: { max: 30 } },
   annotations: {
     readOnlyHint: false,

@@ -10,7 +10,16 @@ import { errorResult, textResult } from "../_shared/tool-result.js";
 const tool = defineTool({
   name: "comet_connect",
   title: "Create a Comet task",
-  description: "Create a new isolated Comet task. By default each call opens a fresh Perplexity tab with its own CDP attachment and AI state, so each new question runs in a clean conversation context with no cross-talk. Pass attach='sidecar'|'thread'|'auto' only when you want to add a follow-up to an existing Perplexity surface (inheriting its conversation history). Returns a task_id that all subsequent comet_* tools accept. Comet must already be running on the host with --remote-debugging-port enabled. Endpoint is configured via COMET_CDP_URL.",
+  description:
+    "Create a new isolated Comet task. One task = one Perplexity tab = one conversation thread. By default each call opens a fresh perplexity.ai tab with its own CDP attachment and AI state, so parallel tasks cannot stomp on each other.\n\n" +
+    "When to call this:\n" +
+    "  • You usually do NOT need to call comet_connect first — `comet_ask` auto-creates a task if none exists. Call this explicitly only when you want a labeled task, want `keepAlive:true`, or want to attach to an existing Perplexity surface.\n" +
+    "  • Pass `attach='sidecar'|'thread'|'auto'` only when you want to ADD a follow-up to an existing Perplexity surface (inheriting its conversation history). For a brand-new question, leave the default `'new'`.\n\n" +
+    "Tab lifecycle:\n" +
+    "  • Tabs the task itself opened (`attach:'new'`) are closed when the task closes (auto-close after a one-shot `comet_ask`, or explicit `comet_task_close`).\n" +
+    "  • Tabs the task only attached to (`sidecar`/`thread`/`auto`) are LEFT OPEN on close.\n" +
+    "  • Use the same `task_id` across multiple `comet_ask` calls (with `closeAfter:false`) to continue the same Perplexity chat history in the same tab.\n\n" +
+    "Returns a `task_id` that all subsequent `comet_*` tools accept. Comet must already be running on the host with `--remote-debugging-port` enabled; endpoint is configured via `COMET_CDP_URL`.",
   rateLimit: { tool: { max: 30 } },
   annotations: {
     readOnlyHint: false,

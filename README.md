@@ -19,6 +19,64 @@ resources, 3 prompts**, fully isolated per-task parallelism.
 
 ---
 
+## Tool / MCP Server description (paste-ready)
+
+Drop this into the "tool description" field of any agent platform (Claude
+Desktop custom MCP, n8n MCP node, Cursor / Cline / Continue, OpenAI Agents
+SDK, LangChain / LlamaIndex tool entry, etc.) so the model understands what
+this server is for and how to call it correctly.
+
+> **comet.mcpgw.app — agentic web browsing via Perplexity Comet**
+>
+> Use this MCP server when a task requires actually using a web browser —
+> visiting URLs, clicking, logging in, filling forms, scraping a specific
+> page, taking an action behind a login wall, or doing deep multi-source
+> research. Perplexity Comet drives the browser; you just send instructions.
+>
+> **Mental model:** one `task_id` = one Perplexity tab = one ongoing chat
+> conversation. Different `task_id`s run in true parallel; the same
+> `task_id` continues the same chat history.
+>
+> **Primary tool:** `comet_ask` — auto-creates a task if needed, sends a
+> prompt, waits for the answer, auto-closes the tab on completion. For
+> browsing tasks, write the prompt as an INSTRUCTION ("Use your browser to
+> navigate to … and …"), not as a keyword query. For multi-turn work, pass
+> `closeAfter:false` and reuse the same `task_id`, then call
+> `comet_task_close` when done. If the run outlives the tool-call window
+> the response comes back as `result_delivery:"async"` — use `comet_poll`
+> or `comet_results` with the returned `task_id` to fetch the final answer.
+>
+> **Reading results:** `structuredContent.completed:true` +
+> `result_delivery:"direct"` ⇒ `response` is the final answer (DONE).
+> `result_delivery:"async"` ⇒ still running, use `comet_poll` /
+> `comet_results`. `partial_response` is incomplete — never present it as
+> final. `status:"input_required"` ⇒ Comet is paused on a confirmation;
+> call `comet_accept_banner` (safe ones) or have the user approve.
+>
+> **Other tools** cover task lifecycle (`comet_connect`, `comet_tasks`,
+> `comet_task_close`), navigation (`comet_navigate`, `comet_back`,
+> `comet_reload`), inspection (`comet_screenshot`, `comet_full_screenshot`,
+> `comet_html`, `comet_dom_query`, `comet_console`, `comet_network`),
+> direct page interaction without the agent (`comet_click`, `comet_type`,
+> `comet_eval`), and browser state (`comet_cookies`, `comet_set_cookie`,
+> `comet_set_viewport`, `comet_block_urls`, `comet_clear_cache`).
+>
+> **Do NOT use** for offline reasoning, code generation, or anything the
+> coding model can answer from its own knowledge — this server costs a
+> real browser tab and a Perplexity request per call.
+
+Short variant (when the platform limits description length to ~500 chars):
+
+> Agentic web browsing via Perplexity Comet. Use `comet_ask` to send an
+> INSTRUCTION (not a keyword query) like "Use your browser to navigate to
+> X and …". Each `task_id` = one tab = one chat thread; same `task_id` +
+> `closeAfter:false` continues the conversation, otherwise the tab
+> auto-closes. Read `structuredContent.response` when `completed:true`;
+> if `result_delivery:"async"`, call `comet_poll` or `comet_results`.
+> Don't use for offline reasoning — every call drives a real browser.
+
+---
+
 ## Why?
 
 - **Search APIs** (Tavily, Perplexity API, WebFetch) return static text only.
